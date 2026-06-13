@@ -17,19 +17,20 @@ runtime:                     # Runtime and profiling settings.
   warmup_frames: 30          # Drain this many frames before metadata/profile output.
 
 inference:                   # Detection controls.
-  workers: 4                 # Detector worker count. Must be 1..number of streams.
+  workers: 1                 # One shared detector graph avoids dispatcher/resource contention.
+  queue_depth: 16            # Frames allowed in the detector graph.
   min_score: 0.55            # Detection score threshold.
   nms_iou: 0.60              # NMS IoU threshold.
   max_detections: 50         # Max detections to keep per frame after NMS.
 
-output:                      # Insight output plus optional local debug saves.
+output:                      # Insight video and metadata output.
   insight:                   # Live video and metadata destination.
     host: <insight-host-ip>  # Host running the Insight receiver/viewer.
     video_port_base: 9000    # Base UDP port for video channels.
     metadata_port_base: 9100 # Base UDP port for metadata channels.
   video_enabled: true        # Disable to publish metadata only.
-  debug_dir: null            # Optional directory for periodic debug frame saves.
-  save_every: 0              # Save every Nth debug frame. 0 disables saving.
+  debug_dir: null            # Ignored by the graph-linked C++ path.
+  save_every: 0              # Ignored by the graph-linked C++ path.
 
 # Test harness settings only. Normal example runs ignore this section.
 testing:

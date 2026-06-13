@@ -12,7 +12,7 @@
 | Model | yolo26m-det-int8-b1 |
 
 ## Concept
-This example runs many RTSP video streams while bounding YOLO26 detector load with a smaller detector worker pool. Each stream owns RTSP decode and clean Insight video output. Detector workers receive latest decoded `Sample` objects from the stream graphs, run YOLO26, and publish `object-detection` metadata to the matching Insight channel.
+This example runs up to 16 RTSP streams through one shared YOLO26 detector graph. Each stream owns RTSP decode and clean Insight video output. The detector input uses Neat Graph realtime latest-by-stream links, so source graphs never build stale detector backlogs; detections publish `object-detection` metadata to the matching Insight channel.
 
 ## Preview
 Snippet from a pipeline run:
@@ -20,19 +20,11 @@ Snippet from a pipeline run:
 ![16-stream object detector preview](../../../assets/portal/object-detection/16-stream-object-detector/image.png)
 
 Architecture:
-- one source/video graph per RTSP stream
-- one smaller YOLO26 detector worker pool shared by streams
-- fixed modulo stream assignment across detector workers
-- latest-frame source output to avoid stale detector backlog
-- clean Insight video stays independent from detection scheduling
-
-Per-stream source graph:
-- `RtspDecodedInput -> Branch(detector_frame, video)`
-- `video -> VideoSender(H.264 RTP/UDP)`
-- `detector_frame -> Output(detector_frame, Latest)`
-
-Detector worker graph:
-- `Input(frame) -> model.graph() -> Output(detections)`
+- one composed Neat Graph for all RTSP streams
+- one shared detector graph: `Input(detector_frame) -> model.graph() -> Output(detections)`
+- per-stream `RtspDecodedInput -> Branch(detector_frame, video)`
+- `detector_frame` connects to the detector with `RealtimeLatestByStream`
+- `video -> VideoSender(H.264 RTP/UDP)` remains independent from detector scheduling
 
 ## Prerequisites
 - Installed Neat SDK.
@@ -82,7 +74,8 @@ This is useful for a quick smoke test without opening RTSP streams.
 
 ### C++
 ```bash
-SIMA_GST_RUN_INPUT_TIMEOUT_MS=120000 ./build/examples/object-detection/16-stream-object-detector/16-stream-object-detector \
+SIMA_GST_RUN_INPUT_TIMEOUT_MS=120000 \
+./build/examples/object-detection/16-stream-object-detector/16-stream-object-detector \
   --config examples/object-detection/16-stream-object-detector/src/common/config.yaml
 ```
 
@@ -97,16 +90,16 @@ SIMA_GST_RUN_INPUT_TIMEOUT_MS=120000 python3 examples/object-detection/16-stream
 ## Debugging notes
 - The checked-in `src/common/config.yaml` includes placeholder stream URLs and Insight host values. Replace them before running.
 - Set the intended detector candidate FPS at the RTSP source. This example does not downsample in the scheduler and does not use `VideoRate`.
-- `inference.workers` must be between 1 and the stream count. For 16 streams, the default 4 workers assign streams as `0,4,8,12`, `1,5,9,13`, `2,6,10,14`, and `3,7,11,15`.
-- `output.debug_dir` and `output.save_every` let you save periodic debug frames locally. Debug saving maps frame pixels on the CPU and is outside the normal live path.
-- Profiling prints source pull, detector, parse, metadata, dropped-frame, timeout, and detection-count summaries.
+- `inference.workers` must be `1`. The graph-linked C++ path uses one shared detector graph; adding app-level detector workers is intentionally not part of this example.
+- `inference.queue_depth` sets the realtime link/downstream detector queue depth. Leave it at the default unless you are profiling throughput.
+- `output.debug_dir`/`output.save_every` are ignored by the graph-linked C++ path so the live path stays zero-copy and customer-facing.
+- Profiling prints aggregate FPS plus per-stream metadata, parse, send, and detection-count summaries. It does not enable heavyweight GStreamer/plugin traces by default; set `APP16_GST_PROFILE=1` only when you need those traces.
 
 ## Notes
 - Point `model.path` at a YOLO26 detection pack. This example does not use a `model.family` config key.
-- Both C++ and Python use the same public graph shape: `RtspDecodedInput`, `graphs::Branch`, `VideoSender`, `Input -> model.graph() -> Output`, and `MetadataSender`.
-- The live video path is graph-owned and independent from detector worker scheduling.
-- Detector workers receive `Sample` objects, not `cv::Mat` or NumPy frames.
-- Metadata uses the selected source frame timestamp and frame id so Insight overlays detections on the intended video frame.
+- The C++ path uses public Graph composition: `RtspDecodedInput`, `graphs::Branch`, `VideoSender`, realtime graph links, `Input -> model.graph() -> Output`, and `MetadataSender`.
+- The live video path is graph-owned and independent from detector scheduling.
+- Metadata uses the graph-preserved stream id, timestamp, and frame id so Insight overlays detections on the intended video stream.
 - `output.video_enabled: false` disables per-stream H.264 video output. Metadata still runs.
 
 ## Source Files
