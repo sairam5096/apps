@@ -1,8 +1,14 @@
 #pragma once
 
-#include <neat.h>
-#include "neat/nodes.h"
-#include "neat/models.h"
+#if __has_include("neat/session.h")
+#  include "neat/session.h"
+#  include "neat/nodes.h"
+#else
+   // New NEAT API: lightweight headers that avoid pulling in gst/gst.h at include time
+#  include "pipeline/GraphOptions.h"
+#  include "pipeline/TensorCore.h"
+#  include "pipeline/Run.h"
+#endif
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/videoio.hpp>
@@ -44,8 +50,7 @@ struct RtspStreamInfo {
 
 bool parse_dim_from_caps(const std::string& caps, const char* key, int& out);
 bool parse_fps_from_caps(const std::string& caps, int& fps_out);
-bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt,
-                            RtspStreamInfo& out);
+bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt, RtspStreamInfo& out);
 bool probe_rtsp_encoded(const std::string& url, const RtspProbeOptions& opt, int fps, int w, int h,
                         int tries, int timeout_ms, bool enforce_caps);
 bool probe_rtsp_decoded_dims(const std::string& url, const RtspProbeOptions& opt, int tries,
@@ -54,6 +59,9 @@ bool probe_rtsp_decoded_dims(const std::string& url, const RtspProbeOptions& opt
 std::filesystem::path default_goldfish_path();
 bool download_file(const std::string& url, const std::filesystem::path& out_path);
 std::string resolve_resnet50_tar();
+std::string resolve_yolov8s_tar(const std::filesystem::path& root = {});
+std::string resolve_yolov8s_tar_local_first(const std::filesystem::path& root = {},
+                                            bool skip_download = false);
 std::filesystem::path ensure_coco_sample(const std::filesystem::path& root = {});
 std::string find_boxdecode_config(const std::filesystem::path& etc_dir);
 std::string prepare_yolo_boxdecode_config(const std::string& src_path,
@@ -97,17 +105,18 @@ bool open_h264_writer(cv::VideoWriter& writer, const std::filesystem::path& out_
 bool extract_bbox_payload(const simaai::neat::Sample& result, std::vector<uint8_t>& payload,
                           std::string& err);
 
-struct MetadataBox {
-  std::string id;
-  std::string label;
-  float confidence = 0.0f;
-  float x = 0.0f;
-  float y = 0.0f;
-  float w = 0.0f;
-  float h = 0.0f;
-};
+using OptiViewObject = simaai::neat::OptiViewObject;
+using OptiViewOptions = simaai::neat::OptiViewChannelOptions;
+using OptiViewSender = simaai::neat::OptiViewJsonOutput;
 
-std::string metadata_boxes_data_json(const std::string& array_key,
-                                     const std::vector<MetadataBox>& boxes);
+inline std::vector<std::string> optiview_default_labels() {
+  return simaai::neat::OptiViewDefaultLabels();
+}
+
+inline std::string optiview_make_json(int64_t timestamp_ms, const std::string& frame_id,
+                                      const std::vector<OptiViewObject>& objects,
+                                      const std::vector<std::string>& labels) {
+  return simaai::neat::OptiViewMakeJson(timestamp_ms, frame_id, objects, labels);
+}
 
 } // namespace sima_examples

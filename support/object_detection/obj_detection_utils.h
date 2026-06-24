@@ -1,6 +1,12 @@
 #pragma once
 
-#include <neat.h>
+#if defined(SIMA_NEAT_GRAPH_API) || !__has_include("neat/session.h")
+   // New NEAT API: Sample/SampleKind/Tensor without pulling in gst/gst.h
+#  include "pipeline/GraphOptions.h"
+#  include "pipeline/TensorCore.h"
+#else
+#  include "neat/session.h"
+#endif
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>

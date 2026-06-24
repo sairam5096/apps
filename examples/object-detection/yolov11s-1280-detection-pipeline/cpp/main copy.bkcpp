@@ -1,0 +1,664 @@
+/**
+ * @example yolov11s-1280-detection-pipeline.cpp
+ * YOLOv11 1280x720 detection pipeline (post-surgery model, EV74 genpreproc).
+ *
+ * Model: 1280.tar.gz — internal pipeline EV74-genpreproc -> MLA -> EV74-detessdequant
+ *   Input:  1280x720 BGR (preproc letterboxes to 1280x1280 internally)
+ *   Output: 6 NDHWC float tensors
+ *     tensors[0:3] bbox (H,W,4)  cx,cy,w,h in model-space pixels (DFL decoded in model)
+ *     tensors[3:6] cls  (H,W,80) probabilities (already sigmoid, class_is_prob=true)
+ *
+ * Usage:
+ *   Folder mode: yolov11s-1280-detection-pipeline <model.tar.gz> <labels.txt> <input_dir> <output_dir>
+ *   RTSP mode:   yolov11s-1280-detection-pipeline <model.tar.gz> <labels.txt> <output_dir> --rtsp <URL>
+ *                  [--frames N] [--insight <host>] [--video-port N] [--meta-port N]
+ *
+ * OptiView / neat-insight streaming (RTSP mode only):
+ *   --insight <host>   IP of the host running neat-insight (e.g. 172.16.1.207)
+ *   --video-port N     UDP port for H.264 RTP video  (default 9000)
+ *   --meta-port N      UDP port base for JSON metadata (default 9100)
+ */
+
+#include "neat.h"
+
+#include "support/object_detection/obj_detection_utils.h"
+
+#include <nodes/io/MetadataSender.h>
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+using Clock = std::chrono::steady_clock;
+using Ms    = std::chrono::duration<double, std::milli>;
+
+namespace {
+
+struct FrameTiming {
+  double read_ms    = 0.0;
+  double preproc_ms = 0.0;
+  double infer_ms   = 0.0;
+  double post_ms    = 0.0;
+  double render_ms  = 0.0;
+  double save_ms    = 0.0;
+  double total() const { return read_ms + preproc_ms + infer_ms + post_ms + render_ms + save_ms; }
+};
+
+struct TimingAcc {
+  double sum = 0.0, mn = 1e18, mx = -1.0;
+  int n = 0;
+  void add(double v) { sum += v; mn = std::min(mn, v); mx = std::max(mx, v); ++n; }
+  double mean() const { return n > 0 ? sum / n : 0.0; }
+};
+
+// Model input dimensions (what EV74 preproc expects)
+constexpr int kInputW  = 1280;
+constexpr int kInputH  = 720;
+// Model internal dimensions (after preproc CENTER letterbox)
+constexpr int kModelW  = 1280;
+constexpr int kModelH  = 1280;
+
+// CENTER letterbox params: 1280x720 -> 1280x1280
+//   gain     = min(1280/720, 1280/1280) = 1.0
+//   pad_top  = (1280 - 720 * 1.0) / 2   = 280.0
+//   pad_left = (1280 - 1280 * 1.0) / 2  = 0.0
+constexpr float kLbGain    = 1.0f;
+constexpr float kLbPadTop  = 280.0f;
+constexpr float kLbPadLeft = 0.0f;
+
+constexpr float kMinScore  = 0.45f;
+constexpr float kNmsIou    = 0.50f;
+constexpr int   kMaxDet    = 24;   // topk from yolo_postproc.json
+constexpr int   kTimeoutMs = 5000;
+
+struct TensorHWC {
+  int h = 0;
+  int w = 0;
+  int c = 0;
+  std::vector<float> data;
+};
+
+bool is_image(const fs::path& p) {
+  std::string ext = p.extension().string();
+  for (char& c : ext) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp");
+}
+
+std::vector<std::string> load_labels(const fs::path& labels_path) {
+  std::ifstream in(labels_path);
+  if (!in.good()) {
+    throw std::runtime_error("labels file does not exist: " + labels_path.string());
+  }
+  std::vector<std::string> labels;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty()) {
+      labels.push_back(line);
+    }
+  }
+  if (labels.empty()) {
+    throw std::runtime_error("labels file is empty: " + labels_path.string());
+  }
+  return labels;
+}
+
+TensorHWC tensor_to_hwc_f32(const simaai::neat::Tensor& t) {
+  if (t.dtype != simaai::neat::TensorDType::Float32) {
+    throw std::runtime_error("expected Float32 tensor for YOLO decode");
+  }
+  // Strip leading size-1 dims to handle NHWC (4D), NDHWC (5D), etc.
+  auto shape = t.shape;
+  while (shape.size() > 3 && shape.front() == 1) {
+    shape.erase(shape.begin());
+  }
+  TensorHWC out;
+  if (shape.size() == 3) {
+    out.h = static_cast<int>(shape[0]);
+    out.w = static_cast<int>(shape[1]);
+    out.c = static_cast<int>(shape[2]);
+  } else {
+    throw std::runtime_error("unexpected tensor rank for HWC decode: " +
+                             std::to_string(t.shape.size()));
+  }
+  const size_t elems =
+      static_cast<size_t>(out.h) * static_cast<size_t>(out.w) * static_cast<size_t>(out.c);
+  const std::vector<uint8_t> bytes = t.copy_dense_bytes_tight();
+  if (bytes.size() < elems * sizeof(float)) {
+    throw std::runtime_error("tensor byte size is smaller than expected");
+  }
+  out.data.resize(elems);
+  std::memcpy(out.data.data(), bytes.data(), elems * sizeof(float));
+  return out;
+}
+
+float iou_xyxy(const objdet::Box& a, const objdet::Box& b) {
+  const float xx1 = std::max(a.x1, b.x1);
+  const float yy1 = std::max(a.y1, b.y1);
+  const float xx2 = std::min(a.x2, b.x2);
+  const float yy2 = std::min(a.y2, b.y2);
+  const float iw = std::max(0.0f, xx2 - xx1);
+  const float ih = std::max(0.0f, yy2 - yy1);
+  const float inter = iw * ih;
+  const float area_a = std::max(0.0f, a.x2 - a.x1) * std::max(0.0f, a.y2 - a.y1);
+  const float area_b = std::max(0.0f, b.x2 - b.x1) * std::max(0.0f, b.y2 - b.y1);
+  const float den = area_a + area_b - inter;
+  return den > 0.0f ? (inter / den) : 0.0f;
+}
+
+// Decode post-surgery YOLOv11 tensors.
+//   tensors[0:3] bbox (H,W,4)  cx,cy,w,h in model pixels (DFL already decoded in model)
+//   tensors[3:6] cls  (H,W,80) probabilities (already sigmoid, class_is_prob=true)
+// Returns boxes in kInputW x kInputH (1280x720) coordinate space.
+std::vector<objdet::Box> decode_yolov11_postsurgery(
+    const simaai::neat::TensorList& tensors, float min_score) {
+  if (tensors.size() < 6) {
+    throw std::runtime_error("expected 6 tensors from detessdequant, got " +
+                             std::to_string(tensors.size()));
+  }
+
+  const float inv_gain = 1.0f / kLbGain;
+
+  std::vector<objdet::Box> candidates;
+  candidates.reserve(4000);
+
+  for (size_t level = 0; level < 3; ++level) {
+    const TensorHWC bbox = tensor_to_hwc_f32(tensors[level]);
+    const TensorHWC cls  = tensor_to_hwc_f32(tensors[level + 3]);
+
+    if (bbox.c != 4) {
+      throw std::runtime_error("bbox tensor[" + std::to_string(level) +
+                               "] has unexpected channel count " + std::to_string(bbox.c) +
+                               " (expected 4: cx,cy,w,h)");
+    }
+    if (bbox.h != cls.h || bbox.w != cls.w) {
+      throw std::runtime_error("bbox/cls tensor spatial size mismatch at level " +
+                               std::to_string(level));
+    }
+
+    for (int y = 0; y < cls.h; ++y) {
+      for (int x = 0; x < cls.w; ++x) {
+        const size_t cls_base =
+            (static_cast<size_t>(y) * static_cast<size_t>(cls.w) + static_cast<size_t>(x)) *
+            static_cast<size_t>(cls.c);
+
+        // Class probs are already sigmoid (class_is_prob=true)
+        int best_class = -1;
+        float best_score = 0.0f;
+        for (int c = 0; c < cls.c; ++c) {
+          const float score = cls.data[cls_base + static_cast<size_t>(c)];
+          if (score > best_score) {
+            best_score = score;
+            best_class = c;
+          }
+        }
+        if (best_score < min_score || best_class < 0) {
+          continue;
+        }
+
+        const size_t bbox_base =
+            (static_cast<size_t>(y) * static_cast<size_t>(bbox.w) + static_cast<size_t>(x)) * 4U;
+        const float cx = bbox.data[bbox_base + 0];
+        const float cy = bbox.data[bbox_base + 1];
+        const float bw = bbox.data[bbox_base + 2];
+        const float bh = bbox.data[bbox_base + 3];
+
+        // Inverse CENTER letterbox: model space (1280x1280) -> original space (1280x720)
+        const float x1 = std::max(0.0f, std::min(static_cast<float>(kInputW),
+                                                  (cx - bw * 0.5f - kLbPadLeft) * inv_gain));
+        const float y1 = std::max(0.0f, std::min(static_cast<float>(kInputH),
+                                                  (cy - bh * 0.5f - kLbPadTop) * inv_gain));
+        const float x2 = std::max(0.0f, std::min(static_cast<float>(kInputW),
+                                                  (cx + bw * 0.5f - kLbPadLeft) * inv_gain));
+        const float y2 = std::max(0.0f, std::min(static_cast<float>(kInputH),
+                                                  (cy + bh * 0.5f - kLbPadTop) * inv_gain));
+        if (x2 > x1 && y2 > y1) {
+          candidates.push_back(objdet::Box{x1, y1, x2, y2, best_score, best_class});
+        }
+      }
+    }
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const objdet::Box& a, const objdet::Box& b) { return a.score > b.score; });
+
+  std::vector<objdet::Box> keep;
+  keep.reserve(static_cast<size_t>(kMaxDet));
+  for (const auto& box : candidates) {
+    bool suppressed = false;
+    for (const auto& kept : keep) {
+      if (kept.class_id == box.class_id && iou_xyxy(kept, box) > kNmsIou) {
+        suppressed = true;
+        break;
+      }
+    }
+    if (!suppressed) {
+      keep.push_back(box);
+      if (static_cast<int>(keep.size()) >= kMaxDet) {
+        break;
+      }
+    }
+  }
+  return keep;
+}
+
+// Scale boxes from kInputW x kInputH (1280x720) to original image dimensions.
+std::vector<objdet::Box> scale_boxes_to_original(const std::vector<objdet::Box>& boxes,
+                                                  int orig_w, int orig_h) {
+  const float sx = static_cast<float>(orig_w) / static_cast<float>(kInputW);
+  const float sy = static_cast<float>(orig_h) / static_cast<float>(kInputH);
+  std::vector<objdet::Box> out;
+  out.reserve(boxes.size());
+  for (const auto& b : boxes) {
+    out.push_back(objdet::Box{b.x1 * sx, b.y1 * sy, b.x2 * sx, b.y2 * sy, b.score, b.class_id});
+  }
+  return out;
+}
+
+std::string class_name(const std::vector<std::string>& labels, int class_id) {
+  if (class_id >= 0 && static_cast<size_t>(class_id) < labels.size()) {
+    return labels[static_cast<size_t>(class_id)];
+  }
+  return std::to_string(class_id);
+}
+
+cv::Scalar class_color(int class_id) {
+  static const std::array<cv::Scalar, 8> kColors = {
+      cv::Scalar(0, 255, 0),   cv::Scalar(255, 0, 0), cv::Scalar(0, 0, 255),
+      cv::Scalar(255, 255, 0), cv::Scalar(255, 0, 255), cv::Scalar(0, 255, 255),
+      cv::Scalar(128, 255, 0), cv::Scalar(255, 128, 0)};
+  const size_t idx = static_cast<size_t>(class_id >= 0 ? class_id : -class_id) % kColors.size();
+  return kColors[idx];
+}
+
+void draw_boxes(cv::Mat& frame, const std::vector<objdet::Box>& boxes,
+                const std::vector<std::string>& labels) {
+  for (const auto& b : boxes) {
+    const int x1 = std::max(0, std::min(frame.cols - 1, static_cast<int>(std::round(b.x1))));
+    const int y1 = std::max(0, std::min(frame.rows - 1, static_cast<int>(std::round(b.y1))));
+    const int x2 = std::max(0, std::min(frame.cols - 1, static_cast<int>(std::round(b.x2))));
+    const int y2 = std::max(0, std::min(frame.rows - 1, static_cast<int>(std::round(b.y2))));
+    if (x2 <= x1 || y2 <= y1) {
+      continue;
+    }
+    const cv::Scalar color = class_color(b.class_id);
+    const std::string text = class_name(labels, b.class_id) + " " + cv::format("%.2f", b.score);
+    cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
+    int baseline = 0;
+    const cv::Size tsz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+    const int y_text_top = std::max(0, y1 - tsz.height - 4);
+    cv::rectangle(frame, cv::Point(x1, y_text_top), cv::Point(x1 + tsz.width, std::max(0, y1)),
+                  color, cv::FILLED);
+    cv::putText(frame, text, cv::Point(x1, std::max(0, y1 - 2)), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+  }
+}
+
+void draw_timing_overlay(cv::Mat& frame, const FrameTiming& t) {
+  const std::string row0 =
+      cv::format("read=%.1fms  preproc=%.1fms  infer=%.1fms",
+                 t.read_ms, t.preproc_ms, t.infer_ms);
+  const std::string row1 =
+      cv::format("post=%.1fms  render=%.1fms  save=%.1fms  total=%.1fms",
+                 t.post_ms, t.render_ms, t.save_ms, t.total());
+  constexpr int    kFont = cv::FONT_HERSHEY_SIMPLEX;
+  constexpr double kSc   = 0.42;
+  constexpr int    kTh   = 1;
+  int baseline = 0;
+  int y = frame.rows - 4;
+  for (const std::string* row : {&row1, &row0}) {
+    const cv::Size sz = cv::getTextSize(*row, kFont, kSc, kTh, &baseline);
+    cv::rectangle(frame,
+                  cv::Point(2, y - sz.height - 2),
+                  cv::Point(4 + sz.width, y + baseline + 2),
+                  cv::Scalar(0, 0, 0), cv::FILLED);
+    cv::putText(frame, *row, cv::Point(4, y), kFont, kSc,
+                cv::Scalar(0, 255, 255), kTh, cv::LINE_AA);
+    y -= sz.height + baseline + 6;
+  }
+}
+
+void print_timing_summary(const std::array<TimingAcc, 6>& acc, int count) {
+  const std::array<const char*, 6> names = {"read", "preproc", "infer", "postproc", "render", "save"};
+  TimingAcc total_acc;
+  std::cout << "\n── Stage timings (" << count << " frames) ──────────────────────────\n";
+  std::cout << cv::format("%-10s  %8s  %8s  %8s\n", "stage", "mean ms", "min ms", "max ms");
+  std::cout << std::string(46, '-') << "\n";
+  double total_sum = 0.0;
+  double total_mn = 1e18, total_mx = -1.0;
+  for (int i = 0; i < 6; ++i) {
+    const auto& a = acc[i];
+    total_sum += a.sum;
+    total_mn  += a.mn;   // sum of per-frame stage mins = lower bound on total
+    total_mx  += a.mx;
+    std::cout << cv::format("%-10s  %8.2f  %8.2f  %8.2f\n",
+                            names[i], a.mean(), a.mn, a.mx);
+  }
+  std::cout << std::string(46, '-') << "\n";
+  const double mean_total = count > 0 ? total_sum / count : 0.0;
+  std::cout << cv::format("%-10s  %8.2f\n", "total", mean_total);
+  std::cout << std::string(46, '-') << "\n";
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+  std::cout.setf(std::ios::unitbuf);
+  std::cerr.setf(std::ios::unitbuf);
+  // Allow CPU tensor → EV74 DMA copy for EV74-genpreproc route (setenv 0 = don't overwrite).
+  ::setenv("SIMA_ALLOW_INPUTSTREAM_CPU_TO_EV74_COPY", "1", 0);
+
+  // Parse args: collect positional args and optional flags.
+  std::string rtsp_url;
+  int rtsp_frames = 50;
+  std::string insight_host;
+  int video_port = 9000;
+  int meta_port  = 9100;
+  std::vector<std::string> pos_args;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--rtsp" && i + 1 < argc) {
+      rtsp_url = argv[++i];
+    } else if (a == "--frames" && i + 1 < argc) {
+      rtsp_frames = std::stoi(argv[++i]);
+    } else if (a == "--insight" && i + 1 < argc) {
+      insight_host = argv[++i];
+    } else if (a == "--video-port" && i + 1 < argc) {
+      video_port = std::stoi(argv[++i]);
+    } else if (a == "--meta-port" && i + 1 < argc) {
+      meta_port = std::stoi(argv[++i]);
+    } else {
+      pos_args.push_back(a);
+    }
+  }
+
+  const bool rtsp_mode = !rtsp_url.empty();
+  const int required_pos = rtsp_mode ? 3 : 4;
+  if (static_cast<int>(pos_args.size()) < required_pos) {
+    std::cerr << "Usage:\n"
+              << "  Folder mode: " << argv[0] << " <model> <labels> <input_dir> <output_dir>\n"
+              << "  RTSP mode:   " << argv[0]
+              << " <model> <labels> <output_dir> --rtsp <URL>"
+              << " [--frames N] [--insight <host>] [--video-port N] [--meta-port N]\n";
+    return 1;
+  }
+
+  const std::string model_path  = pos_args[0];
+  const fs::path    labels_path = pos_args[1];
+  const fs::path    input_dir   = rtsp_mode ? fs::path{} : fs::path{pos_args[2]};
+  const fs::path    output_dir  = rtsp_mode ? fs::path{pos_args[2]} : fs::path{pos_args[3]};
+
+  if (!rtsp_mode && !fs::is_directory(input_dir)) {
+    std::cerr << "Input directory does not exist: " << input_dir << "\n";
+    return 2;
+  }
+  fs::create_directories(output_dir);
+
+  std::vector<std::string> labels;
+  try {
+    labels = load_labels(labels_path);
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << "\n";
+    return 2;
+  }
+
+  std::vector<fs::path> images;
+  if (!rtsp_mode) {
+    for (const auto& entry : fs::directory_iterator(input_dir)) {
+      if (entry.is_regular_file() && is_image(entry.path())) {
+        images.push_back(entry.path());
+      }
+    }
+    std::sort(images.begin(), images.end());
+
+    if (images.empty()) {
+      std::cerr << "No images found in " << input_dir << "\n";
+      return 3;
+    }
+    std::cout << "Found " << images.size() << " images\n";
+  } else {
+    std::cout << "[RTSP] stream -> capturing " << rtsp_frames << " frames -> " << output_dir << "\n";
+  }
+
+  try {
+    simaai::neat::Model::Options model_opt;
+
+    model_opt.preprocess.input_max_width  = kInputW;
+    model_opt.preprocess.input_max_height = kInputH;
+    model_opt.preprocess.input_max_depth  = 3;
+    model_opt.preprocess.color_convert.input_format = simaai::neat::PreprocessColorFormat::BGR;
+
+    simaai::neat::Model model(model_path, model_opt);
+
+    auto runner = model.build();
+    std::cout << "[BUILD] Model loaded: " << model_path << "\n";
+    std::cout << "[BUILD] Input: " << kInputW << "x" << kInputH << " BGR -> 1280x1280 letterbox\n";
+
+    // Per-stage timing accumulators: [read, preproc, infer, post, render, save]
+    std::array<TimingAcc, 6> stage_acc;
+
+    auto infer_bgr = [&](const cv::Mat& bgr_in,
+                         double& preproc_ms, double& infer_ms, double& post_ms)
+        -> std::vector<objdet::Box> {
+      auto _t0 = Clock::now();
+      cv::Mat frame_720;
+      cv::resize(bgr_in, frame_720, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_LINEAR);
+      preproc_ms = Ms(Clock::now() - _t0).count();
+
+      simaai::neat::TensorList tensors_out;
+      { auto _ti = Clock::now(); tensors_out = runner.run(std::vector<cv::Mat>{frame_720}, kTimeoutMs); infer_ms = Ms(Clock::now() - _ti).count(); }
+      auto _tp = Clock::now();
+      auto boxes_720 = decode_yolov11_postsurgery(tensors_out, kMinScore);
+      post_ms = Ms(Clock::now() - _tp).count();
+      return scale_boxes_to_original(boxes_720, bgr_in.cols, bgr_in.rows);
+    };
+
+    int processed = 0;
+
+    if (rtsp_mode) {
+      // ── RTSP mode ─────────────────────────────────────────────────────────
+      cv::VideoCapture cap(rtsp_url);
+      if (!cap.isOpened()) {
+        std::cerr << "Failed to open RTSP stream: " << rtsp_url << "\n";
+        return 5;
+      }
+      const int stream_w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+      const int stream_h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+      const int stream_fps = std::max(1, static_cast<int>(cap.get(cv::CAP_PROP_FPS)));
+      std::cout << "[RTSP] stream " << stream_w << "x" << stream_h << "@" << stream_fps
+                << " -> resizing to " << kInputW << "x" << kInputH << " for model\n";
+
+      // ── OptiView / neat-insight streaming setup ────────────────────────────
+      cv::VideoWriter rtp_writer;
+      std::unique_ptr<simaai::neat::MetadataSender> meta_sender;
+      if (!insight_host.empty()) {
+        std::ostringstream gst;
+        gst << "appsrc ! videoconvert"
+            << " ! video/x-raw,format=I420,width=" << stream_w
+            << ",height=" << stream_h << ",framerate=" << stream_fps << "/1"
+            << " ! x264enc speed-preset=ultrafast tune=zerolatency bitrate=1000"
+            << " key-int-max=" << stream_fps
+            << " ! rtph264pay config-interval=1 pt=96"
+            << " ! udpsink host=" << insight_host
+            << " port=" << video_port << " sync=false async=false";
+        rtp_writer.open(gst.str(), cv::CAP_GSTREAMER, 0,
+                        static_cast<double>(stream_fps), cv::Size(stream_w, stream_h), true);
+        if (rtp_writer.isOpened()) {
+          std::cout << "[insight] video  -> udp://" << insight_host << ":" << video_port << "\n";
+        } else {
+          std::cerr << "[insight] warn: failed to open GStreamer RTP writer — video disabled\n";
+        }
+
+        simaai::neat::MetadataSenderOptions meta_opt;
+        meta_opt.host               = insight_host;
+        meta_opt.channel            = 0;
+        meta_opt.metadata_port_base = meta_port;
+        std::string meta_err;
+        meta_sender = std::make_unique<simaai::neat::MetadataSender>(meta_opt, &meta_err);
+        if (meta_sender->ok()) {
+          std::cout << "[insight] metadata -> udp://" << insight_host
+                    << ":" << meta_sender->metadata_port() << "\n";
+        } else {
+          std::cerr << "[insight] warn: MetadataSender: " << meta_err << " — metadata disabled\n";
+          meta_sender.reset();
+        }
+      }
+
+      // ── Async save thread: PNG writes happen off the critical path ─────────
+      struct SaveTask { cv::Mat frame; fs::path path; };
+      std::queue<SaveTask>      save_q;
+      std::mutex                save_mu;
+      std::condition_variable   save_cv_var;
+      std::atomic<bool>         save_stop{false};
+      std::thread save_thread([&]() {
+        while (true) {
+          std::unique_lock<std::mutex> lk(save_mu);
+          save_cv_var.wait(lk, [&]{ return !save_q.empty() || save_stop.load(); });
+          if (save_q.empty() && save_stop.load()) break;
+          auto task = std::move(save_q.front()); save_q.pop();
+          lk.unlock();
+          cv::imwrite(task.path.string(), task.frame);
+        }
+      });
+
+      for (int fi = 0; fi < rtsp_frames; ++fi) {
+        FrameTiming ft;
+        cv::Mat bgr;
+        { auto _tr = Clock::now(); bool ok = cap.read(bgr); ft.read_ms = Ms(Clock::now() - _tr).count();
+          if (!ok || bgr.empty()) { std::cerr << "[RTSP] stream ended after " << fi << " frames\n"; break; } }
+
+        std::vector<objdet::Box> boxes;
+        try {
+          boxes = infer_bgr(bgr, ft.preproc_ms, ft.infer_ms, ft.post_ms);
+        } catch (const std::exception& e) {
+          std::cerr << "Decode failed frame " << fi << ": " << e.what() << "\n";
+          continue;
+        }
+        { auto _tr = Clock::now(); draw_boxes(bgr, boxes, labels); ft.render_ms = Ms(Clock::now() - _tr).count(); }
+        draw_timing_overlay(bgr, ft);
+
+        // ── Send rendered frame + detections to neat-insight ────────────────
+        if (rtp_writer.isOpened()) {
+          rtp_writer.write(bgr);
+        }
+        if (meta_sender) {
+          std::ostringstream jss;
+          jss << "{\"objects\":[";
+          for (size_t bi = 0; bi < boxes.size(); ++bi) {
+            const auto& b = boxes[bi];
+            if (bi > 0) jss << ",";
+            jss << "{\"id\":\"" << bi << "\""
+                << ",\"label\":\"" << class_name(labels, b.class_id) << "\""
+                << ",\"confidence\":" << cv::format("%.4f", b.score)
+                << ",\"x\":" << cv::format("%.4f", b.x1 / stream_w)
+                << ",\"y\":" << cv::format("%.4f", b.y1 / stream_h)
+                << ",\"w\":" << cv::format("%.4f", (b.x2 - b.x1) / stream_w)
+                << ",\"h\":" << cv::format("%.4f", (b.y2 - b.y1) / stream_h) << "}";
+          }
+          jss << "]}";
+          const int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+          std::string meta_err;
+          meta_sender->send_metadata("object-detection", jss.str(), ts_ms,
+                                     std::to_string(fi), &meta_err);
+        }
+
+        // ── Enqueue PNG save (non-blocking) ─────────────────────────────────
+        const std::string fname = "frame_" + cv::format("%05d", fi) + ".png";
+        const fs::path out_path = output_dir / fname;
+        { auto _ts = Clock::now();
+          std::lock_guard<std::mutex> lk(save_mu);
+          save_q.push({bgr.clone(), out_path});
+          save_cv_var.notify_one();
+          ft.save_ms = Ms(Clock::now() - _ts).count(); }
+
+        ++processed;
+        stage_acc[0].add(ft.read_ms);  stage_acc[1].add(ft.preproc_ms);
+        stage_acc[2].add(ft.infer_ms); stage_acc[3].add(ft.post_ms);
+        stage_acc[4].add(ft.render_ms); stage_acc[5].add(ft.save_ms);
+        std::cout << "[" << (fi + 1) << "/" << rtsp_frames << "] " << fname
+                  << " (" << boxes.size() << " det)"
+                  << cv::format(" | read=%.1f pre=%.1f inf=%.1f post=%.1f rndr=%.1f enq=%.2fms\n",
+                                ft.read_ms, ft.preproc_ms, ft.infer_ms,
+                                ft.post_ms, ft.render_ms, ft.save_ms);
+      }
+      cap.release();
+      if (rtp_writer.isOpened()) rtp_writer.release();
+
+      // Drain the save queue
+      { std::lock_guard<std::mutex> lk(save_mu); save_stop = true; }
+      save_cv_var.notify_all();
+      save_thread.join();
+    } else {
+      // ── Folder mode ───────────────────────────────────────────────────────
+      for (const auto& image_path : images) {
+        FrameTiming ft;
+        cv::Mat bgr;
+        { auto _tr = Clock::now(); bgr = cv::imread(image_path.string(), cv::IMREAD_COLOR); ft.read_ms = Ms(Clock::now() - _tr).count(); }
+        if (bgr.empty()) {
+          std::cerr << "Skipping unreadable: " << image_path.filename() << "\n";
+          continue;
+        }
+        std::vector<objdet::Box> boxes;
+        try {
+          boxes = infer_bgr(bgr, ft.preproc_ms, ft.infer_ms, ft.post_ms);
+        } catch (const std::exception& e) {
+          std::cerr << "Decode failed for " << image_path.filename() << ": " << e.what() << "\n";
+          continue;
+        }
+        { auto _tr = Clock::now(); draw_boxes(bgr, boxes, labels); ft.render_ms = Ms(Clock::now() - _tr).count(); }
+        draw_timing_overlay(bgr, ft);
+        const fs::path out_path = output_dir / (image_path.stem().string() + ".png");
+        { auto _ts = Clock::now();
+          if (!cv::imwrite(out_path.string(), bgr)) { std::cerr << "Failed to write: " << out_path << "\n"; continue; }
+          ft.save_ms = Ms(Clock::now() - _ts).count(); }
+        ++processed;
+        stage_acc[0].add(ft.read_ms);  stage_acc[1].add(ft.preproc_ms);
+        stage_acc[2].add(ft.infer_ms); stage_acc[3].add(ft.post_ms);
+        stage_acc[4].add(ft.render_ms); stage_acc[5].add(ft.save_ms);
+        std::cout << "[" << processed << "/" << images.size() << "] "
+                  << image_path.filename() << " -> " << out_path.filename()
+                  << " (" << boxes.size() << " det)"
+                  << cv::format(" | read=%.1f pre=%.1f inf=%.1f post=%.1f rndr=%.1f save=%.1f | total=%.1fms\n",
+                                ft.read_ms, ft.preproc_ms, ft.infer_ms,
+                                ft.post_ms, ft.render_ms, ft.save_ms, ft.total());
+      }
+    }
+
+    if (processed > 0) {
+      print_timing_summary(stage_acc, processed);
+    }
+
+    runner.close();
+
+    std::cout << "Done: " << processed << " frames processed\n";
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << "\n";
+    return 4;
+  }
+}

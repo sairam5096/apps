@@ -3,8 +3,12 @@
 #include "asset_utils.h"
 #include "support/object_detection/obj_detection_utils.h"
 
-#include <neat.h>
-#include "neat/nodes.h"
+#if __has_include("neat/session.h")
+#  include "neat/session.h"
+#  include "neat/nodes.h"
+#else
+#  include "neat.h"
+#endif
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
@@ -255,11 +259,10 @@ bool parse_fps_from_caps(const std::string& caps, int& fps_out) {
   return true;
 }
 
-bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt,
-                            RtspStreamInfo& out) {
+bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt, RtspStreamInfo& out) {
   out = RtspStreamInfo{};
 
-  simaai::neat::Graph probe;
+  simaai::neat::Session probe;
   probe.add(simaai::neat::nodes::RTSPInput(url, opt.latency_ms, opt.rtsp_tcp,
                                            /*drop_on_latency=*/true, /*buffer_mode=*/"none"));
   probe.add(simaai::neat::nodes::H264Depacketize(opt.payload_type,
@@ -271,6 +274,7 @@ bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt,
   probe.add(simaai::neat::nodes::Output());
 
   simaai::neat::RunOptions run_opt;
+  run_opt.enable_metrics = opt.debug;
   simaai::neat::Run run = probe.build(run_opt);
 
   simaai::neat::Sample sample;
@@ -293,7 +297,7 @@ bool probe_rtsp_stream_info(const std::string& url, const RtspProbeOptions& opt,
 
 bool probe_rtsp_encoded(const std::string& url, const RtspProbeOptions& opt, int fps, int w, int h,
                         int tries, int timeout_ms, bool enforce_caps) {
-  simaai::neat::Graph probe;
+  simaai::neat::Session probe;
   probe.add(simaai::neat::nodes::RTSPInput(url, opt.latency_ms, opt.rtsp_tcp,
                                            /*drop_on_latency=*/true, /*buffer_mode=*/"none"));
   probe.add(simaai::neat::nodes::H264Depacketize(opt.payload_type,
@@ -306,6 +310,7 @@ bool probe_rtsp_encoded(const std::string& url, const RtspProbeOptions& opt, int
 
   simaai::neat::RunOptions run_opt;
   run_opt.output_memory = simaai::neat::OutputMemory::ZeroCopy;
+  run_opt.enable_metrics = opt.debug;
   simaai::neat::Run run = probe.build(run_opt);
 
   bool ok = false;
@@ -325,7 +330,7 @@ bool probe_rtsp_decoded_dims(const std::string& url, const RtspProbeOptions& opt
   out_w = 0;
   out_h = 0;
 
-  simaai::neat::Graph probe;
+  simaai::neat::Session probe;
   probe.add(simaai::neat::nodes::RTSPInput(url, opt.latency_ms, opt.rtsp_tcp,
                                            /*drop_on_latency=*/true, /*buffer_mode=*/"none"));
   probe.add(simaai::neat::nodes::H264Depacketize(opt.payload_type,
@@ -347,19 +352,17 @@ bool probe_rtsp_decoded_dims(const std::string& url, const RtspProbeOptions& opt
 
   simaai::neat::RunOptions run_opt;
   run_opt.output_memory = simaai::neat::OutputMemory::ZeroCopy;
+  run_opt.enable_metrics = opt.debug;
   simaai::neat::Run run = probe.build(run_opt);
 
   bool ok = false;
   for (int i = 0; i < tries; ++i) {
     auto out = run.pull(timeout_ms);
-    if (!out.has_value())
-      continue;
-    const auto tensors = simaai::neat::tensors_from_sample(*out, false);
-    if (tensors.empty())
+    if (!out.has_value() || !out->tensor.has_value())
       continue;
     int w = 0;
     int h = 0;
-    if (sima_examples::infer_dims(tensors.front(), w, h) && w > 0 && h > 0) {
+    if (sima_examples::infer_dims(out->tensor.value(), w, h) && w > 0 && h > 0) {
       out_w = w;
       out_h = h;
       ok = true;
@@ -780,9 +783,9 @@ void check_top1(const std::vector<float>& scores, int expected_id, float min_pro
 simaai::neat::Tensor pull_tensor_with_retry(simaai::neat::Run& run, const std::string& label,
                                             int per_try_ms, int tries) {
   for (int i = 0; i < tries; ++i) {
-    auto tensors = run.pull_tensors(per_try_ms);
-    if (!tensors.empty())
-      return tensors.front();
+    auto t = run.pull_tensor(per_try_ms);
+    if (t.has_value())
+      return *t;
   }
   throw std::runtime_error(label + ": no tensor received (timeout/EOS)");
 }
@@ -820,21 +823,6 @@ bool open_h264_writer(cv::VideoWriter& writer, const fs::path& out_path, int wid
 bool extract_bbox_payload(const simaai::neat::Sample& result, std::vector<uint8_t>& payload,
                           std::string& err) {
   return objdet::extract_bbox_payload(result, payload, err);
-}
-
-std::string metadata_boxes_data_json(const std::string& array_key,
-                                     const std::vector<MetadataBox>& boxes) {
-  json data;
-  data[array_key] = json::array();
-  for (const auto& box : boxes) {
-    data[array_key].push_back({
-        {"id", box.id},
-        {"label", box.label},
-        {"confidence", box.confidence},
-        {"bbox", {box.x, box.y, box.w, box.h}},
-    });
-  }
-  return data.dump();
 }
 
 } // namespace sima_examples
