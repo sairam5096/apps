@@ -79,12 +79,13 @@
                   <option value="ja">日本語 (Japanese)</option>
                   <option value="ko">한국어 (Korean)</option>
                   <option value="zh">中文 (Chinese)</option>
+                  <option value="vi">Tiếng Việt (Vietnamese)</option>
                 </select>
               </div>
 
               <div class="setting-row voice-language-group" id="voiceRow">
                 <label for="voiceSelect" class="setting-label">
-                  English Voice:
+                  Voice:
                 </label>
                 <select id="voiceSelect" class="setting-select">
                   <option value="default" selected>Default</option>
@@ -93,6 +94,15 @@
                   <option value="amy">Amy</option>
                 </select>
                 <div id="voiceStatus" class="voice-status"></div>
+              </div>
+              <div class="setting-row utterance-speed-row">
+                <label for="utteranceSpeedRange" class="setting-label">
+                  Utterance Speed:
+                </label>
+                <div class="utterance-speed-control">
+                  <input type="range" id="utteranceSpeedRange" min="0.75" max="1.50" step="0.05" value="1.00">
+                  <span id="utteranceSpeedValue">1.00x</span>
+                </div>
               </div>
             </div>
 
@@ -168,9 +178,7 @@
             <button id="sendButton" class="input-button" title="Send">
               <img src="{{ url_for('static', filename='icons/send.png') }}" alt="Send" width="24" height="24">
             </button>
-            <button id="recordButton" class="input-button" title="Record Audio"
-              data-muted-url="{{ url_for('static', filename='icons/muted.png') }}"
-              data-active-url="{{ url_for('static', filename='icons/microphone.png') }}">
+            <button id="recordButton" class="input-button" title="Record Audio">
               <img id="recordIcon" src="{{ url_for('static', filename='icons/muted.png') }}" alt="Record" width="24"
                 height="24">
             </button>
@@ -211,6 +219,12 @@
     </div>
   </div>
 
+  <script>
+    window.recordIconUrls = Object.freeze({
+      muted: "{{ url_for('static', filename='icons/muted.png') }}",
+      active: "{{ url_for('static', filename='icons/microphone.png') }}"
+    });
+  </script>
   <script src="{{ url_for('static', filename='newui.js') }}"></script>
   <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
 </body>

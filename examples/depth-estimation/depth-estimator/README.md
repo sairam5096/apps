@@ -5,7 +5,8 @@
 | --- | --- |
 | Category | depth-estimation |
 | Difficulty | Intermediate |
-| Tags | depth-estimation |
+| Tags | depth-estimation, depth-anything, folder-inference |
+| Languages | C++, Python |
 | Status | experimental |
 | Binary Name | depth-estimator |
 | Model | depth_anything_v2_vits |
@@ -19,73 +20,63 @@ Snippet from a pipeline run:
 ![Depth estimator preview](../../../assets/portal/depth-estimation/depth-estimator/image.png)
 
 ## Supported Models
-Use the platform version wherever `<platform-version>` appears.
+Use the SDK platform version wherever `<platform-version>` appears.
 
 Primary model: `depth_anything_v2_vits`
 
-Download into `assets/models/`:
-- `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get depth_anything_v2_vits && cd ../..`
+Download the model:
+
+```bash
+mkdir -p assets/models
+cd assets/models
+sima-cli modelzoo -v <platform-version> get depth_anything_v2_vits
+cd ../..
+```
+
+The command stores the model under `assets/models/` as a repo-local convention. `model.path` can point to any readable model package path.
 
 ## Prerequisites
-- Installed Neat SDK.
-- Model artifacts are user-managed and should be downloaded into `assets/models/`.
-- Download command: `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get depth_anything_v2_vits && cd ../..`
+- Installed Neat Development Environment + Neat Library.
+- Model artifacts are user-managed and should be downloaded into `assets/models/`. Download the default model, or set `model.path` to another readable model package.
 
-## Important Behavior
-- Runtime settings are read from `src/common/config.yaml` by default.
-- Input directory is scanned for common image extensions.
-- Output files are written to the configured output directory.
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
 
-## Command-Line Options
-### C++
-- Invocation:
-  `./build/examples/depth-estimation/depth-estimator/depth-estimator [--config <path>]`
-- Optional arguments:
-  `--config <path>`: YAML config path. Defaults to `src/common/config.yaml`.
+Clone and build the apps repo inside the Neat Development Environment:
 
-### Python
-- Invocation:
-  `python examples/depth-estimation/depth-estimator/src/python/main.py [--config <path>]`
-- Optional arguments:
-  `--config <path>`: YAML config path. Defaults to `src/common/config.yaml`.
-
-## Build
-### Build From The Apps Repo
 ```bash
-cd <apps-repo-root>
-./build.sh
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
 ```
 
-Binary output:
-```bash
-./build/examples/depth-estimation/depth-estimator/depth-estimator
-```
+After building, run the example commands below on the Modalix/DevKit board.
 
-### Build This Example Directly With CMake
-```bash
-cd <apps-repo-root>/examples/depth-estimation/depth-estimator
-cmake -S cpp -B build
-cmake --build build -j
-```
+## Configure
+Edit `examples/depth-estimation/depth-estimator/src/common/config.yaml`.
 
-Binary output:
-```bash
-./build/depth-estimator
+```yaml
+model:
+  path: <model-path>                         # Path to the model package.
+
+io:
+  input_dir: assets/test_images                         # Folder containing input images.
+  output_dir: sandbox/depth-estimator                   # Folder for depth visualizations.
 ```
 
 ## Run
-Edit `examples/depth-estimation/depth-estimator/src/common/config.yaml` to point at the model and image folder.
-
 ### C++
 ```bash
-./build/examples/depth-estimation/depth-estimator/depth-estimator
+./build/examples/depth-estimation/depth-estimator/depth-estimator \
+  --config examples/depth-estimation/depth-estimator/src/common/config.yaml
 ```
 
 ### Python
 ```bash
 source ~/pyneat/bin/activate
 pip install -r examples/depth-estimation/depth-estimator/src/python/requirements.txt
-python examples/depth-estimation/depth-estimator/src/python/main.py
+python3 examples/depth-estimation/depth-estimator/src/python/main.py \
+  --config examples/depth-estimation/depth-estimator/src/common/config.yaml
 ```
 
 ## Debugging Notes

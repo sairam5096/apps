@@ -5,7 +5,8 @@
 | --- | --- |
 | Category | segmentation |
 | Difficulty | Intermediate |
-| Tags | segmentation |
+| Tags | segmentation, yolov8, instance-segmentation, folder-inference |
+| Languages | C++, Python |
 | Status | experimental |
 | Binary Name | yolov8-instance-segmenter |
 | Model | yolo_v8n_seg |
@@ -19,66 +20,53 @@ Snippet from a pipeline run:
 ![Instance segmenter preview](../../../assets/portal/segmentation/yolov8-instance-segmenter/image.jpg)
 
 ## Supported Models
-Use the platform version wherever `<platform-version>` appears.
+Use the SDK platform version wherever `<platform-version>` appears.
 
-Also works with: `yolo_v8s_seg`, `yolo_v8m_seg`, `yolo_v8l_seg`
+Default model: `yolo_v8n_seg`.
 
-Download any variant into `assets/models/`:
-- `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get yolo_v8n_seg && cd ../..`
+Download the default model:
+
+```bash
+mkdir -p assets/models
+cd assets/models
+
+sima-cli modelzoo -v <platform-version> get yolo_v8n_seg
+
+cd ../..
+```
+
+The command stores the model under `assets/models/` as a repo-local convention. `model.path` can point to any readable model package path.
 
 ## Prerequisites
-- Installed Neat SDK.
-- Model artifacts are user-managed and should be downloaded into `assets/models/`.
-- Download command: `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get yolo_v8n_seg && cd ../..`
+- Installed Neat Development Environment + Neat Library.
+- Model artifacts are user-managed and should be downloaded into `assets/models/`. Download the default model, or set `model.path` to another readable model package.
 
-## Important Behavior
-- Model path is positional and required.
-- Input directory is scanned for common image extensions.
-- Output images include per-instance mask overlays plus bounding boxes/class labels.
-- Runtime and decode settings live in `src/common/config.yaml`.
-- Inference runs on a resized model input, but saved overlays preserve the original image resolution.
-- Uses YOLOv8-seg tensors for box regression/class scores, mask coefficients, and prototype masks.
-- Masks, mask contours, and bounding boxes share the same vivid class-color palette.
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
 
-## Command-Line Options
-### C++
-- Invocation:
-  `./build/examples/segmentation/yolov8-instance-segmenter/yolov8-instance-segmenter [--config <path>]`
-- Required arguments:
-  None. Defaults to `src/common/config.yaml`.
-- Optional arguments:
-  `--config <path>`
+Clone and build the apps repo inside the Neat Development Environment:
 
-### Python
-- Invocation:
-  `python3 examples/segmentation/yolov8-instance-segmenter/src/python/main.py [--config <path>]`
-- Required arguments:
-  None. Defaults to `src/common/config.yaml`.
-- Optional arguments:
-  `--config <path>`
-
-## Build
-### Build From The Apps Repo
 ```bash
-cd <apps-repo-root>
-./build.sh
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
 ```
 
-Binary output:
-```bash
-./build/examples/segmentation/yolov8-instance-segmenter/yolov8-instance-segmenter
-```
+After building, run the example commands below on the Modalix/DevKit board.
 
-### Build This Example Directly With CMake
-```bash
-cd <apps-repo-root>/examples/segmentation/yolov8-instance-segmenter
-cmake -S cpp -B build
-cmake --build build -j
-```
+## Configure
+Edit `examples/segmentation/yolov8-instance-segmenter/src/common/config.yaml`.
 
-Binary output:
-```bash
-./build/yolov8-instance-segmenter
+```yaml
+model:
+  path: <model-path>                   # Path to the model package.
+
+io:
+  input_dir: assets/test_images                 # Folder containing input images.
+  output_dir: sandbox/yolov8-instance-segmenter # Folder for annotated images.
+
+decode:
+  score_threshold: 0.25                         # Minimum instance confidence.
 ```
 
 ## Run
@@ -100,6 +88,10 @@ python3 examples/segmentation/yolov8-instance-segmenter/src/python/main.py \
 - If startup fails, verify model file path and filename.
 - If output is empty, check `decode.score_threshold` and `runtime.infer_size`.
 - Ensure output directory is writable.
+
+## Appendix: Additional Models
+This example also works with `yolo_v8s_seg`, `yolo_v8m_seg`, and `yolo_v8l_seg`.
+Replace `yolo_v8n_seg` in the download command and update `model.path`.
 
 ## Source Files
 - C++ source: `src/cpp/main.cpp`

@@ -215,6 +215,23 @@ render_readme() {
 ## Concept
 TODO: describe what this example demonstrates.
 
+## Prerequisites
+- Installed Neat Development Environment + Neat Library.
+- Model artifacts are user-managed and should be downloaded into \`assets/models/\`.
+
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
+
+Then clone and build the apps repo inside the Neat Development Environment:
+
+\`\`\`bash
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
+\`\`\`
+
+After building, run the example commands below on the Modalix/DevKit board.
+
 ## Build
 ### Build From The Apps Repo
 \`\`\`bash

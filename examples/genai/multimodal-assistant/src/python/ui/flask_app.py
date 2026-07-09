@@ -46,6 +46,23 @@ RAG_DB_PATH = None
 start_service = None
 create_markdown_vectordb = None
 
+
+def save_image_upload_as_base64(image_file, upload_folder):
+    filename = secure_filename(image_file.filename or "")
+    if not filename:
+        raise ValueError("Invalid image file name")
+
+    upload_dir = Path(upload_folder).resolve()
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    image_path = (upload_dir / filename).resolve()
+    # Raises ValueError if filename resolution escapes upload_dir.
+    image_path.relative_to(upload_dir)
+
+    image_file.save(str(image_path))
+    with image_path.open('rb') as img_file:
+        return image_path, base64.b64encode(img_file.read()).decode('utf-8')
+
+
 def ensure_rag_modules_loaded():
     global rag_db_client
     global RAG_DB_PATH
@@ -106,6 +123,7 @@ class TalkController:
         self.totalk = ''
         self.talk = []
         self.pipers = {}
+        self.utterance_speed = 1.0
         self.missing_voice_warnings = set()
         self._init_pipers_threaded(supported_langs or ['en'])
         
@@ -129,6 +147,16 @@ class TalkController:
     def set_language(self, lang):
         self.current_language = lang if lang in self.supported_langs else 'xx'
 
+    def set_utterance_speed(self, speed):
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            speed = 1.0
+        self.utterance_speed = max(0.5, min(2.0, speed))
+        for piper in self.pipers.values():
+            if hasattr(piper, 'set_utterance_speed'):
+                piper.set_utterance_speed(self.utterance_speed)
+
     def _init_pipers_threaded(self, langs):
         threads = []
         assets = Path("assets")
@@ -136,9 +164,11 @@ class TalkController:
         def load_piper(lang_code, onnx_file):
             from pipertts import PiperTTS # import here if needed locally
             try:
-                self.pipers[lang_code] = PiperTTS(
+                piper = PiperTTS(
                     model_path=str(onnx_file)
                 )
+                piper.set_utterance_speed(self.utterance_speed)
+                self.pipers[lang_code] = piper
                 logging.info(f"Loaded Piper model for {lang_code}")
             except Exception as e:
                 logging.warning(f"Failed to load Piper model for {lang_code}: {e}")
@@ -612,7 +642,7 @@ class AppContext:
             self.set_system_prompt(self.system_prompt)
 
         if not self.apionly:
-            self.talk_ctrl = TalkController(['en', 'fr', 'es', 'de', 'it', 'zh']) 
+            self.talk_ctrl = TalkController(['en', 'fr', 'es', 'de', 'it', 'zh', 'vi'])
 
     def update_from_config(self, app_cfg):
         model_server = f"{app_cfg.openai.client_host}:{app_cfg.openai.port}"
@@ -782,17 +812,20 @@ class AppContext:
                 if not voice_id:
                     return jsonify({'error': 'voiceId is required'}), 400
                 assets_dir = Path('assets')
-                candidate = assets_dir / voice_id
-                if not candidate.exists():
-                    # try adding .onnx
-                    candidate = assets_dir / f"{voice_id}.onnx"
-                if not candidate.exists():
-                    return jsonify({'error': f'Voice model not found: {voice_id}'}), 404
+                voice_name = str(voice_id)
+                voice_names = [voice_name]
+                if not voice_name.endswith('.onnx'):
+                    voice_names.append(f"{voice_name}.onnx")
+                available_voices = {path.name: path for path in assets_dir.glob('*.onnx')}
+                candidate = next((available_voices[name] for name in voice_names if name in available_voices), None)
+                if candidate is None:
+                    return jsonify({'error': 'Voice model not found'}), 404
 
                 from pipertts import PiperTTS
                 with self.talk_ctrl.lock:
                     old = self.talk_ctrl.pipers.get(lang)
                     new_voice = PiperTTS(model_path=str(candidate))
+                    new_voice.set_utterance_speed(self.talk_ctrl.utterance_speed)
                     self.talk_ctrl.pipers[lang] = new_voice
                     self.current_voice_by_lang[lang] = candidate.name
                     # Drop reference to old instance; GC will reclaim when unreferenced
@@ -813,9 +846,9 @@ class AppContext:
                     logging.warning(f"Voice switch confirmation audio failed: {ee}")
 
                 return jsonify({'status': 'ok', 'lang': lang, 'current': self.current_voice_by_lang.get(lang)})
-            except Exception as e:
-                logging.error(f"Voice selection failed: {e}")
-                return jsonify({'error': str(e)}), 500
+            except Exception:
+                logging.exception("Voice selection failed")
+                return jsonify({'error': 'Voice selection failed'}), 500
 
         @self.app.route('/stop', methods=['POST'])
         def stop_processing():
@@ -862,17 +895,19 @@ class AppContext:
 
             # Handle form fields
             language = request.form.get('language', 'en')
+            utterance_speed = request.form.get('utteranceSpeed', '1.0')
             chat = request.form.get('textchat', '').strip()
             search_rag = request.form.get('searchRag', 'false').lower() == 'true'
             include_chat_history = request.form.get('includeChatHistory', 'true').lower() == 'true'
             cfg = genai_app.get_config()
             try:
                 selected_model = self.resolve_chat_model(request.form.get('chatModel'))
-            except ValueError as e:
-                return jsonify({'error': str(e)}), 400
+            except ValueError:
+                return jsonify({'error': 'Invalid chat model'}), 400
 
             self.talk_ctrl.reset()
             self.talk_ctrl.set_language(language)
+            self.talk_ctrl.set_utterance_speed(utterance_speed)
             had_active_generation = self.interrupt_active_generation(
                 preserve_partial=include_chat_history
             )
@@ -888,12 +923,10 @@ class AppContext:
             audio_path = None
 
             if image_file:
-                image_path = os.path.join(cfg['UPLOAD_FOLDER'], image_file.filename)
-                image_file.save(image_path)
-
-                # Convert image to base64 for conversation history
-                with open(image_path, 'rb') as img_file:
-                    image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                try:
+                    image_path, image_base64 = save_image_upload_as_base64(image_file, cfg['UPLOAD_FOLDER'])
+                except ValueError:
+                    return jsonify({'error': 'Invalid image file name'}), 400
 
             # If textchat is present, use it directly
             if chat:
@@ -1018,6 +1051,7 @@ class AppContext:
                 model = data.get('model', 'piper-tts')
                 voice = data.get('voice', 'default')
                 language = data.get('language', 'en')
+                utterance_speed = data.get('utterance_speed', data.get('utteranceSpeed', 1.0))
                 response_format = data.get('response_format', 'wav')
 
                 if not text:
@@ -1029,6 +1063,7 @@ class AppContext:
 
                 logging.info(f"Received TTS request: model={model}, voice={voice}, format={response_format}")
 
+                self.talk_ctrl.set_utterance_speed(utterance_speed)
                 result = self.talk_ctrl.tts_on_demand(text, language=language)
 
                 # Default to WAV for Piper. If mp3 is requested, you need ffmpeg to convert.
@@ -1049,9 +1084,9 @@ class AppContext:
                     }
                 )
 
-            except Exception as e:
-                logging.error(f"TTS endpoint error: {e}")
-                return jsonify({'error': str(e)}), 500
+            except Exception:
+                logging.exception("TTS endpoint error")
+                return jsonify({'error': 'TTS request failed'}), 500
 
         # Only register image upload route if not in LLM-only mode
         if not self.llm_only:
@@ -1066,8 +1101,8 @@ class AppContext:
                 cfg = genai_app.get_config()
                 try:
                     selected_model = self.resolve_chat_model(request.form.get('chatModel'))
-                except ValueError as e:
-                    return jsonify({'error': str(e)}), 400
+                except ValueError:
+                    return jsonify({'error': 'Invalid chat model'}), 400
 
                 had_active_generation = self.interrupt_active_generation(preserve_partial=True)
                 if had_active_generation:
@@ -1079,12 +1114,10 @@ class AppContext:
                 image_path = None
                 image_base64 = None
                 if image_file:
-                    image_path = os.path.join(cfg['UPLOAD_FOLDER'], image_file.filename)
-                    image_file.save(image_path)
-
-                    # Convert image to base64 for conversation history
-                    with open(image_path, 'rb') as img_file:
-                        image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                    try:
+                        image_path, image_base64 = save_image_upload_as_base64(image_file, cfg['UPLOAD_FOLDER'])
+                    except ValueError:
+                        return jsonify({'error': 'Invalid image file name'}), 400
 
                 # Add to conversation history and start assistant response (always has image)
                 self.add_user_message(query_str, has_image=True, image_base64=image_base64)

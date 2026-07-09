@@ -3,7 +3,7 @@
 ## Metadata
 | Field | Value |
 | --- | --- |
-| Category | <benchmarking / classification / object-detection / face-detection / segmentation / depth-estimation / genai / throughput> |
+| Category | <benchmarking / classification / object-detection / tracking / face-detection / segmentation / depth-estimation / genai / throughput> |
 | Difficulty | <Beginner / Intermediate / Advanced> |
 | Tags | <comma-separated tags> |
 | Languages | C++, Python |
@@ -12,7 +12,7 @@
 | Model | <default_model_name> [https://example.com/path/to/<default_model_name>_mpk.tar.gz] |
 
 ## Concept
-<1-2 paragraphs: what this example demonstrates and which NEAT capabilities it exercises.>
+<1-2 paragraphs: what this example demonstrates and which Neat Library capabilities it exercises.>
 
 ## Preview
 Optional. If you have a demo screenshot for the portal detail page, place it here immediately after `Concept`.
@@ -22,82 +22,76 @@ Optional. If you have a demo screenshot for the portal detail page, place it her
 ```
 
 ## Supported Models
-Use the platform version wherever `<platform-version>` appears.
+Use the SDK platform version wherever `<platform-version>` appears.
 
-Also works with: `<model_variant_1>`, `<model_variant_2>`
+Default model: `<default-model>`.
 
-Download any variant into `assets/models/`:
-- `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get <model_variant_1> && cd ../..`
+Download the default model:
+
+```bash
+mkdir -p assets/models
+cd assets/models
+
+sima-cli modelzoo -v <platform-version> get <default-model>
+
+cd ../..
+```
+
+For another supported model, replace `<default-model>` in the download command and config path.
+The command stores models under `assets/models/` as a repo-local convention. `model.path` can point to any readable model package path.
 
 ## Prerequisites
-- Installed Neat SDK.
-- Model artifacts are user-managed and should be downloaded into `assets/models/`.
+- Installed Neat Development Environment + Neat Library.
+- Model artifacts are user-managed and should be downloaded into `assets/models/`. Download the default model, or set `model.path` to another readable model package.
 - If the model is not available through modelzoo, add a direct download URL in the `Model` metadata field using the `[https://...]` suffix.
-- Download command: `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get <default_model_name> && cd ../..`
 
-## Important Behavior
-- This example expects the model path to be provided explicitly at runtime.
-- Input and output paths are user-provided.
-- Update this section with any example-specific behavior that affects runtime results.
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
 
-## Command-Line Options
-### C++
-- Invocation:
-  `./build/examples/<category>/<name>/<binary> <args>`
-- Required arguments:
-  `<required_arg_1> <required_arg_2>`
-- Optional arguments:
-  `--flag <value>`
+Clone and build the apps repo inside the Neat Development Environment:
 
-### Python
-- Invocation:
-  `python3 examples/<category>/<name>/src/python/main.py <args>`
-- Required arguments:
-  `<required_arg_1> <required_arg_2>`
-- Optional arguments:
-  `--flag <value>`
-
-## Build
-### Build From The Apps Repo
 ```bash
-cd <apps-repo-root>
-./build.sh
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
 ```
 
-Binary output:
-```bash
-./build/examples/<category>/<name>/<binary>
-```
+After building, run the example commands below on the Modalix/DevKit board.
 
-### Build This Example Directly With CMake
-```bash
-cd <apps-repo-root>
-cmake -S examples/<category>/<name>/src/cpp -B build/<name>
-cmake --build build/<name> -j
-```
+## Configure
+Edit `examples/<category>/<name>/src/common/config.yaml`.
 
-Binary output:
-```bash
-./build/<name>/<binary>
+```yaml
+model:
+  path: <model-path>             # Path to the model package.
+
+io:
+  input_dir: assets/test_images           # Folder containing input images.
+  output_dir: sandbox/<name>              # Folder for generated outputs.
 ```
 
 ## Run
 ### C++
 ```bash
-./build/examples/<category>/<name>/<binary> <args>
+./build/examples/<category>/<name>/<binary> \
+  --config examples/<category>/<name>/src/common/config.yaml
 ```
 
 ### Python
 ```bash
 source ~/pyneat/bin/activate
 pip install -r examples/<category>/<name>/src/python/requirements.txt
-python3 examples/<category>/<name>/src/python/main.py <args>
+python3 examples/<category>/<name>/src/python/main.py \
+  --config examples/<category>/<name>/src/common/config.yaml
 ```
 
 ## Debugging Notes
-- Confirm the model file exists under `assets/models/`.
+- Confirm `model.path` points to a readable model package.
 - Confirm input paths exist and are readable.
 - Confirm output directories are writable.
+
+## Appendix: Additional Models
+This example can also run with `<model_variant_1>` or `<model_variant_2>`. Replace the default model name in the download command and config path.
 
 ## Source Files
 - Test scope: `tests/test-scope.yaml`

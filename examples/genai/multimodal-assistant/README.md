@@ -4,12 +4,12 @@
 | Field | Value |
 | --- | --- |
 | Category | genai |
-| Difficulty | Intermediate |
-| Tags | genai, vlm, asr, tts, openai |
+| Difficulty | Advanced |
+| Tags | genai, vlm, asr, tts, openai-compatible |
 | Languages | Python |
 | Status | experimental |
 | Binary Name | multimodal-assistant |
-| Model | LLM/VLM and Whisper ASR model directories |
+| Model | Qwen3-VL-4B-Instruct-GPTQ-a16w4 + whisper-small-a16w8 |
 
 ## Concept
 This example hosts SiMa-supported GenAI models through Neat's OpenAI-compatible server and uses the imported Flask demo UI as the interactive assistant surface.
@@ -40,15 +40,28 @@ Multimodal assistant UI:
 ![Multimodal Assistant preview](../../../assets/portal/genai/multimodal-assistant/image.png)
 
 ## Prerequisites
-Install Neat before running the demo. The model server uses the Python
-environment where `pyneat` is available. The default scripts assume:
+- Installed Neat Development Environment + Neat Library.
+- The model server uses the Python environment where `pyneat` is available. The default scripts assume:
 
 ```text
 ~/pyneat/bin/python
 ```
 
-Set `PYNEAT_PYTHON=/path/to/python-with-pyneat` if your Neat environment is
+Set `PYNEAT_PYTHON=/path/to/python-with-pyneat` if your Neat Library environment is
 somewhere else.
+
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
+
+Clone and build the apps repo inside the Neat Development Environment:
+
+```bash
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
+```
+
+After building, run the example commands below on the Modalix/DevKit board.
 
 ## Install
 Fetch only this example:

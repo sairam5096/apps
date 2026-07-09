@@ -53,7 +53,7 @@ Environment:
                             Scratch directory override for Vulcan core installs
                             (default: fresh /tmp/neat-apps-core-install.XXXXXX)
   NEAT_CORE_INSTALL_MODE    legacy or vulcan. Defaults to vulcan when NEAT_VULCAN_ENV is set.
-  NEAT_VULCAN_ENV           Vulcan artifact environment for sima-cli core installs
+  NEAT_VULCAN_ENV           Vulcan artifact environment for sima-cli core installs (default: production)
   CMAKE_TOOLCHAIN_FILE      Optional CMake toolchain file (auto-detected for cross)
   SYSROOT                   Target sysroot (used by the default cross toolchain file)
 EOF
@@ -61,6 +61,16 @@ EOF
 
 sanitize_branch_key() {
   printf '%s' "$1" | tr '/ ' '--'
+}
+
+core_artifact_branch_key() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+ref_key = urllib.parse.quote(sys.argv[1], safe="")
+print(urllib.parse.quote(ref_key, safe=""))
+PY
 }
 
 git_short_sha() {
@@ -99,10 +109,29 @@ git_branch_key() {
   sanitize_branch_key "${raw}"
 }
 
+tag_version() {
+  local tag
+  tag="$(current_dependency_tag)"
+  if [[ -z "${tag}" ]]; then
+    return 1
+  fi
+  if [[ "${tag}" =~ ^v[0-9] ]]; then
+    tag="${tag#v}"
+  fi
+  printf '%s\n' "${tag}"
+}
+
+artifact_version() {
+  if tag_version; then
+    return 0
+  fi
+  git_short_sha
+}
+
 package_distribution() {
   local build_path="${ROOT_DIR}/${BUILD_DIR}"
   local stage_dir="${ROOT_DIR}/neat-apps-runtime"
-  local branch_key short_sha archive_name archive_path
+  local branch_key version archive_name archive_path
   local neat_core_branch neat_core_version
 
   if [[ ! -d "${build_path}" ]]; then
@@ -111,8 +140,8 @@ package_distribution() {
   fi
 
   branch_key="$(git_branch_key)"
-  short_sha="$(git_short_sha)"
-  archive_name="neat-apps-${branch_key}-${short_sha}.tar.gz"
+  version="$(artifact_version)"
+  archive_name="neat-apps-${branch_key}-${version}.tar.gz"
   archive_path="${ROOT_DIR}/${archive_name}"
 
   rm -rf "${stage_dir}"
@@ -192,7 +221,27 @@ PY
   mkdir -p "${stage_dir}/scripts"
   cp "${ROOT_DIR}/scripts/download_models.sh" "${stage_dir}/scripts/download_models.sh"
   cp "${ROOT_DIR}/tests/conftest.py" "${stage_dir}/examples/conftest.py"
-  cp -a "${ROOT_DIR}/assets/." "${stage_dir}/assets/"
+  local asset_files=()
+  if git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mapfile -t asset_files < <(git -C "${ROOT_DIR}" ls-files assets)
+  fi
+  if [[ "${#asset_files[@]}" -eq 0 ]]; then
+    mapfile -t asset_files < <(
+      find "${ROOT_DIR}/assets" -type f \
+        ! -path "${ROOT_DIR}/assets/models/*" \
+        ! -name '.DS_Store' \
+        | sed "s#^${ROOT_DIR}/##" \
+        | sort
+    )
+  fi
+  for rel in "${asset_files[@]}"; do
+    local src_file target_dir
+    src_file="${ROOT_DIR}/${rel}"
+    [[ -f "${src_file}" ]] || continue
+    target_dir="${stage_dir}/$(dirname "${rel}")"
+    mkdir -p "${target_dir}"
+    cp "${src_file}" "${target_dir}/"
+  done
 
   find "${stage_dir}" -type d -name "__pycache__" -prune -exec rm -rf {} +
   find "${stage_dir}" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
@@ -390,7 +439,7 @@ core_artifact_version_exists() {
     return 1
   fi
 
-  branch_key="$(sanitize_branch_key "${branch}")"
+  branch_key="$(core_artifact_branch_key "${branch}")"
   download_text "${NEAT_ARTIFACTS_BASE_URL}/${branch_key}/${version}/metadata.json" >/dev/null 2>&1
 }
 
@@ -522,7 +571,7 @@ resolve_latest_version() {
   local branch_key cache_key cache_path missing_path latest_url
   local resolved=""
 
-  branch_key="$(sanitize_branch_key "${branch}")"
+  branch_key="$(core_artifact_branch_key "${branch}")"
   cache_key="$(printf '%s' "${branch_key}" | tr -c 'A-Za-z0-9._-' '_')"
   cache_path="${LATEST_TAG_CACHE_DIR}/${cache_key}.tag"
   missing_path="${LATEST_TAG_CACHE_DIR}/${cache_key}.missing"
@@ -750,7 +799,7 @@ ensure_neat_core() {
     fi
   fi
   if [[ "${install_mode}" == "vulcan" ]]; then
-    vulcan_env="${NEAT_VULCAN_ENV:-dev}"
+    vulcan_env="${NEAT_VULCAN_ENV:-production}"
   fi
 
   # Resolve "latest" to an exact tag before checking installed state.

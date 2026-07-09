@@ -19,6 +19,27 @@ from tests.utils.e2e_config import (
     write_merged_config,
 )
 
+__all__ = [
+    "apps_root",
+    "e2e_config_section",
+    "models_dir",
+    "rtsp_h264_url",
+    "rtsp_h264_urls",
+    "rtsp_mjpeg_url",
+    "rtsp_mjpeg_urls",
+    "http_mjpeg_url",
+    "http_mjpeg_urls",
+    "tmp_output_dir",
+    "e2e_config_writer",
+    "e2e_subprocess_artifacts",
+    "e2e_model_path",
+    "run_until_output_files",
+    "test_images_dir",
+    "test_timeout_ms",
+    "require_e2e",
+    "skip_unless_e2e_ready",
+]
+
 
 def _require_env(key: str, description: str) -> str:
     """Return env var value or skip/fail depending on strict mode."""
@@ -33,6 +54,7 @@ def _require_env(key: str, description: str) -> str:
             "Set it or unset SIMANEAT_APPS_TEST_REQUIRE_E2E."
         )
     pytest.skip(f"set {key} ({description}) to run this test")
+    raise AssertionError("pytest.skip returned unexpectedly")
 
 
 @pytest.fixture
@@ -63,19 +85,51 @@ def models_dir() -> Path:
     return APPS_ROOT / "assets" / "models"
 
 
-@pytest.fixture
-def rtsp_url() -> str:
-    """Resolve SIMANEAT_APPS_TEST_RTSP_URL; skip if unset."""
-    return _require_env("SIMANEAT_APPS_TEST_RTSP_URL", "single RTSP stream URL")
-
-
-@pytest.fixture
-def rtsp_urls() -> list[str]:
-    """Resolve SIMANEAT_APPS_TEST_RTSP_URLS (comma-separated); skip if unset."""
-    raw = _require_env(
-        "SIMANEAT_APPS_TEST_RTSP_URLS", "comma-separated RTSP URLs for multistream"
-    )
+def _csv_env(key: str, description: str) -> list[str]:
+    raw = _require_env(key, description)
     return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+@pytest.fixture
+def rtsp_h264_url() -> str:
+    """Resolve SIMANEAT_TEST_RTSP_H264_URL; skip if unset."""
+    return _require_env("SIMANEAT_TEST_RTSP_H264_URL", "single RTSP H.264 stream URL")
+
+
+@pytest.fixture
+def rtsp_h264_urls() -> list[str]:
+    """Resolve SIMANEAT_TEST_RTSP_H264_URLS; skip if unset."""
+    return _csv_env(
+        "SIMANEAT_TEST_RTSP_H264_URLS", "comma-separated RTSP H.264 URLs for multistream"
+    )
+
+
+@pytest.fixture
+def rtsp_mjpeg_url() -> str:
+    """Resolve SIMANEAT_TEST_RTSP_MJPEG_URL; skip if unset."""
+    return _require_env("SIMANEAT_TEST_RTSP_MJPEG_URL", "single RTSP MJPEG stream URL")
+
+
+@pytest.fixture
+def rtsp_mjpeg_urls() -> list[str]:
+    """Resolve SIMANEAT_TEST_RTSP_MJPEG_URLS; skip if unset."""
+    return _csv_env(
+        "SIMANEAT_TEST_RTSP_MJPEG_URLS", "comma-separated RTSP MJPEG URLs"
+    )
+
+
+@pytest.fixture
+def http_mjpeg_url() -> str:
+    """Resolve SIMANEAT_TEST_HTTP_MJPEG_URL; skip if unset."""
+    return _require_env("SIMANEAT_TEST_HTTP_MJPEG_URL", "single HTTP MJPEG stream URL")
+
+
+@pytest.fixture
+def http_mjpeg_urls() -> list[str]:
+    """Resolve SIMANEAT_TEST_HTTP_MJPEG_URLS; skip if unset."""
+    return _csv_env(
+        "SIMANEAT_TEST_HTTP_MJPEG_URLS", "comma-separated HTTP MJPEG URLs"
+    )
 
 
 @pytest.fixture

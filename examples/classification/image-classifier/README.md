@@ -6,6 +6,7 @@
 | Category | classification |
 | Difficulty | Beginner |
 | Tags | classification, model, mpk |
+| Languages | C++, Python |
 | Status | experimental |
 | Binary Name | image-classifier |
 | Model | resnet_50 |
@@ -19,62 +20,50 @@ The pipeline is trying to classify this goldfish image.
 ![Image classifier goldfish input](../../../assets/portal/classification/image-classifier/image.jpeg)
 
 ## Supported Models
-Use the platform version wherever `<platform-version>` appears.
+Use the SDK platform version wherever `<platform-version>` appears.
 
 Primary model: `resnet_50`
 
-Download into `assets/models/`:
-- `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get resnet_50 && cd ../..`
+Download the model:
+
+```bash
+mkdir -p assets/models
+cd assets/models
+sima-cli modelzoo -v <platform-version> get resnet_50
+cd ../..
+```
+
+The command stores the model under `assets/models/` as a repo-local convention. `model.path` can point to any readable model package path.
 
 ## Prerequisites
-- Installed Neat SDK.
-- Model artifacts are user-managed and should be downloaded into `assets/models/`.
-- Download command: `mkdir -p assets/models && cd assets/models && sima-cli modelzoo -v <platform-version> get resnet_50 && cd ../..`
+- Installed Neat Development Environment + Neat Library.
+- Model artifacts are user-managed and should be downloaded into `assets/models/`. Download the default model, or set `model.path` to another readable model package.
 
-## Important Behavior
-- Runtime settings live in `src/common/config.yaml`.
-- If `io.image` is null, the example downloads a sample goldfish image automatically.
-- `validation.min_probability` controls the pass/fail threshold for the expected class probability.
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
 
-## Command-Line Options
-### C++
-- Invocation:
-  `./build/examples/classification/image-classifier/image-classifier [--config <path>]`
-- Required arguments:
-  None. Defaults to `src/common/config.yaml`.
-- Optional arguments:
-  `--config <path>`
+Clone and build the apps repo inside the Neat Development Environment:
 
-### Python
-- Invocation:
-  `python examples/classification/image-classifier/src/python/main.py [--config <path>]`
-- Required arguments:
-  None. Defaults to `src/common/config.yaml`.
-- Optional arguments:
-  `--config <path>`
-
-## Build
-### Build From The Apps Repo
 ```bash
-cd <apps-repo-root>
-./build.sh
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
 ```
 
-Binary output:
-```bash
-./build/examples/classification/image-classifier/image-classifier
-```
+After building, run the example commands below on the Modalix/DevKit board.
 
-### Build This Example Directly With CMake
-```bash
-cd <apps-repo-root>/examples/classification/image-classifier
-cmake -S cpp -B build
-cmake --build build -j
-```
+## Configure
+Edit `examples/classification/image-classifier/src/common/config.yaml` if you want to use a different image or threshold.
 
-Binary output:
-```bash
-./build/image-classifier
+```yaml
+model:
+  path: <model-path>                        # Path to the model package.
+
+io:
+  image: null                               # Input image. null uses the sample image.
+
+validation:
+  min_probability: 0.50                     # Minimum expected-class probability.
 ```
 
 ## Run
@@ -88,12 +77,12 @@ Binary output:
 ```bash
 source ~/pyneat/bin/activate
 pip install -r examples/classification/image-classifier/src/python/requirements.txt
-python examples/classification/image-classifier/src/python/main.py \
+python3 examples/classification/image-classifier/src/python/main.py \
   --config examples/classification/image-classifier/src/common/config.yaml
 ```
 
 ## Debugging Notes
-- If you see a model load error, verify the model file exists at `assets/models/resnet_50_mpk.tar.gz`.
+- If you see a model load error, verify `model.path` points to a readable model package.
 - If image decode fails, set `io.image` in the config.
 - If top-1 validation fails, try lowering `validation.min_probability` for debug runs.
 

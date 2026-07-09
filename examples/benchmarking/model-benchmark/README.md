@@ -27,27 +27,39 @@ This example accepts any compiled model package supported by `pyneat.Model`.
 `tests/test-scope.yaml` lists the compiled model packages already used by Apps examples. `BENCHMARK_RESULTS.md` is the manually maintained table for reference benchmark results.
 
 ## Prerequisites
-- Installed Neat SDK.
+- Installed Neat Development Environment + Neat Library.
 - Activated `pyneat` environment.
-- A compiled model package available locally, usually under `assets/models/`.
+- Model artifacts are user-managed and should be downloaded into `assets/models/`.
 
-## Important Behavior
-- `benchmark.frames` controls the measured synthetic frames passed to `Model.benchmark()`.
-- The default report path is `sandbox/model-benchmark/report.json`.
-- The JSON report is the stable output for comparing model packages.
+## Get The Apps Repo
+Use the [Neat Development Environment](https://developer.sima.ai/software/getting-started/dev-environment/) with the [Neat Library](https://developer.sima.ai/software/getting-started/neat-library/) installed for setup and compilation.
 
-## Command-Line Options
-### Python
-- Invocation:
-  `python3 examples/benchmarking/model-benchmark/src/python/main.py [--config <path>] [--model <path>] [--frames <n>] [--output-json <path>]`
-- Optional arguments:
-  `--config <path>`: YAML config path. Defaults to `src/common/config.yaml`.
-  `--model <path>`: compiled model package path. Overrides `model.path`.
-  `--frames <n>`: measured synthetic frames. Overrides `benchmark.frames`.
-  `--output-json <path>`: report path. Overrides `output.report_json`.
+Clone and build the apps repo inside the Neat Development Environment:
+
+```bash
+git clone https://github.com/sima-neat/apps.git
+cd apps
+./build.sh --clean
+```
+
+After building, run the example commands below on the Modalix/DevKit board.
+
+## Configure
+Edit `examples/benchmarking/model-benchmark/src/common/config.yaml`, or override these values from the command line.
+
+```yaml
+model:
+  path: <model-path>                          # Path to the model package.
+
+benchmark:
+  frames: 1000                                # Number of synthetic frames.
+
+output:
+  report_json: sandbox/model-benchmark/report.json # JSON report path.
+```
 
 ## Run
-From the Apps repo root:
+On the Modalix/DevKit board, from the Apps repo root:
 
 ```bash
 source ~/pyneat/bin/activate
