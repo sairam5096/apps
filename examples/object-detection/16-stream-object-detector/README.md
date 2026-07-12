@@ -105,8 +105,8 @@ install the matching Core/Internals artifacts into their normal target locations
 Do not mix these revisions with another handoff:
 
 - Apps implementation: `130a65929031371be9cf09f4f1a1b888ceab7c77`
-- Core: `33aedfd2de7f46c7b904d9f36ac09dc2c302bee9`
-- Internals: `79c856c8d4f013982a211fc4f498e42f9ca13737`
+- Core: `4e7ee6988f141f94f7183201a962c436ce6be6ff`
+- Internals: `eaac934590a95bda3555f7dcc652b81e3e4bfcd9`
 
 The Apps SHA deliberately names the functional commit before this non-self-referential
 documentation pin. For a clean install, use the matching revisions and artifact checksums in the
