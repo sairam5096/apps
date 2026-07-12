@@ -104,7 +104,7 @@ install the matching Core/Internals artifacts into their normal target locations
 
 Do not mix these revisions with another handoff:
 
-- Apps implementation: `533fa1a12c0ae1bccbe9425fbf0fa7c0837e740f`
+- Apps implementation: `abdd3ce759b7a88af4a3102eb32da17a51df2f75`
 - Core: `4e7ee6988f141f94f7183201a962c436ce6be6ff`
 - Internals: `eaac934590a95bda3555f7dcc652b81e3e4bfcd9`
 
