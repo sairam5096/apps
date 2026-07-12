@@ -241,16 +241,23 @@ tile. This optional mode catches duplicated or cross-wired media without making 
 streams depend on a synthetic pixel signature. When the manifest includes the generated temporal
 marker, the gate samples it seven times by default and also requires:
 
-- every binary frame-code segment to advance forward at the requested rate (backward/repeated
-  content fails);
+- every binary frame-code segment, captured from one composited video-frame draw, to advance
+  forward at the requested rate (backward/repeated content fails without per-bit tearing);
 - metadata message count and metadata PTS-derived frame code to advance on every segment;
 - metadata `rtp_timestamp` to equal the 90 kHz value derived from its PTS; and
-- every displayed video code and metadata PTS-derived code to remain within the manifest's
-  absolute `sync_tolerance_frames`, with a stable offset across the run. A stable but large lag
-  fails, as do stale repeated boxes.
+- the displayed frame's browser `VideoFrameMetadata.rtpTimestamp` and App metadata
+  `rtp_timestamp` to remain within `sync_tolerance_frames * 90000 / fps` ticks. A stale or large
+  RTP lag fails, as do stale repeated boxes.
+
+The fixture frame code and pipeline PTS can have an arbitrary channel-specific origin offset when
+the publisher was already running before App16 joined. The gate records that offset and its
+stability as a diagnostic but never requires it to be near zero; direct displayed-video/metadata
+RTP distance is the synchronization authority.
 
 The pre-document hook observes both viewer-created DataChannels and remotely created channels
-delivered through the browser's `datachannel` event, before Insight installs its own handler.
+delivered through the browser's `datachannel` event, before Insight installs its own handler. It
+also starts a `requestVideoFrameCallback` loop for each video tile and retains the latest presented
+frame RTP timestamp and callback count.
 
 Insight currently assigns each channel's metadata DataChannel to one viewer. Close the
 operator viewer before this active gate, then refresh it after the gate closes. Running two

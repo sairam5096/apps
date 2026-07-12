@@ -689,40 +689,74 @@ class TestHandoffGates:
                 "rtpTimestamp": (pts_ns * 90000 // 1_000_000_000) & 0xFFFFFFFF,
             }
 
-        forward = [
-            {"temporalCode": 0, "metadata": metadata(5, 10)},
-            {"temporalCode": 20, "metadata": metadata(25, 30)},
-            {"temporalCode": 40, "metadata": metadata(45, 50)},
-        ]
-        assert gate.analyze_temporal_samples(forward, [0.0, 1.0, 2.0], temporal)[
-            "passed"
-        ]
+        def sample(code: int, frame: int, count: int, callback_count: int, rtp_lag=0):
+            row = metadata(frame, count)
+            return {
+                "temporalCode": code,
+                "metadata": row,
+                "videoFrame": {
+                    "callbackCount": callback_count,
+                    "rtpTimestamp": (row["rtpTimestamp"] + rtp_lag) & 0xFFFFFFFF,
+                },
+            }
 
-        backward = [forward[0], forward[1], {"temporalCode": 10, "metadata": metadata(15, 40)}]
+        # The publisher was already 40 seconds (800 frames) into the fixture
+        # when App16 joined. This stable media-origin offset is legitimate;
+        # direct video/metadata RTP equality is the synchronization authority.
+        forward = [
+            sample(0, 800, 10, 10),
+            sample(20, 820, 30, 30),
+            sample(40, 840, 50, 50),
+        ]
+        forward_result = gate.analyze_temporal_samples(
+            forward, [0.0, 1.0, 2.0], temporal
+        )
+        assert forward_result["media_origin_offset_stable"]
+        assert forward_result["media_origin_offsets_frames"] == [800, 800, 800]
+        assert forward_result["video_metadata_rtp_synced"]
+        assert forward_result["passed"]
+
+        backward = [forward[0], forward[1], sample(10, 840, 50, 50)]
         assert not gate.analyze_temporal_samples(backward, [0.0, 1.0, 2.0], temporal)[
             "passed"
         ]
 
-        stale = [forward[0], forward[1], {"temporalCode": 40, "metadata": metadata(25, 30)}]
+        stale = [forward[0], forward[1], sample(40, 820, 30, 50, rtp_lag=20 * 4500)]
         assert not gate.analyze_temporal_samples(stale, [0.0, 1.0, 2.0], temporal)["passed"]
 
-        stable_but_far_behind = [
-            {"temporalCode": 0, "metadata": metadata(100, 10)},
-            {"temporalCode": 20, "metadata": metadata(120, 30)},
-            {"temporalCode": 40, "metadata": metadata(140, 50)},
+        large_rtp_mismatch = [
+            sample(0, 800, 10, 10, rtp_lag=100 * 4500),
+            sample(20, 820, 30, 30, rtp_lag=100 * 4500),
+            sample(40, 840, 50, 50, rtp_lag=100 * 4500),
         ]
-        far_result = gate.analyze_temporal_samples(
-            stable_but_far_behind, [0.0, 1.0, 2.0], temporal
+        mismatch_result = gate.analyze_temporal_samples(
+            large_rtp_mismatch, [0.0, 1.0, 2.0], temporal
         )
-        assert far_result["pts_video_offset_stable"]
-        assert not far_result["pts_video_offset_synced"]
-        assert not far_result["passed"]
+        assert mismatch_result["media_origin_offset_stable"]
+        assert not mismatch_result["video_metadata_rtp_synced"]
+        assert not mismatch_result["passed"]
 
     def test_visual_gate_hooks_local_and_remote_data_channels(self):
         gate = load_script_module("app16_insight_visual_gate")
         assert "createDataChannel" in gate.CANVAS_HOOK_JS
         assert "addEventListener('datachannel'" in gate.CANVAS_HOOK_JS
         assert "setRemoteDescription" in gate.CANVAS_HOOK_JS
+        assert "requestVideoFrameCallback" in gate.CANVAS_HOOK_JS
+
+        temporal = {
+            "x": 8,
+            "y": 70,
+            "bit_width": 8,
+            "bit_height": 20,
+            "bit_stride": 12,
+            "bits": 12,
+            "period_frames": 2400,
+            "fps": 20,
+            "luma_threshold": 128,
+            "sync_tolerance_frames": 6,
+        }
+        sample_script = gate.sample_js([0], None, temporal)
+        assert sample_script.count("bitCtx.drawImage(") == 1
 
     def test_identity_fixture_plan_is_unique_and_forces_no_b_frames(self):
         fixture = load_script_module("app16_make_identity_fixtures")

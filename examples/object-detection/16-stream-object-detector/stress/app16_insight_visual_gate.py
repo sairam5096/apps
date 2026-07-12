@@ -165,6 +165,44 @@ CANVAS_HOOK_JS = r"""
     wrap(name, '__app16PaintOps');
   }
 
+  // Track the RTP timestamp of every frame actually presented by each video
+  // element. This must be installed before Insight creates its tiles so the
+  // App metadata RTP timestamp can be compared without assuming that the
+  // publisher and pipeline PTS origins both started at frame zero.
+  const videoFrameMetadata = new WeakMap();
+  const trackedVideos = new WeakSet();
+  const originalVideoFrameCallback = HTMLVideoElement.prototype.requestVideoFrameCallback;
+  const trackVideo = video => {
+    if (!originalVideoFrameCallback || trackedVideos.has(video)) return;
+    trackedVideos.add(video);
+    const onFrame = (_, metadata) => {
+      const previous = videoFrameMetadata.get(video) || {callbackCount: 0};
+      videoFrameMetadata.set(video, {
+        callbackCount: previous.callbackCount + 1,
+        rtpTimestamp: Number.isFinite(metadata.rtpTimestamp)
+          ? metadata.rtpTimestamp : null,
+        presentedFrames: Number.isFinite(metadata.presentedFrames)
+          ? metadata.presentedFrames : null,
+        mediaTime: Number.isFinite(metadata.mediaTime) ? metadata.mediaTime : null,
+      });
+      originalVideoFrameCallback.call(video, onFrame);
+    };
+    originalVideoFrameCallback.call(video, onFrame);
+  };
+  const scanVideos = node => {
+    if (node instanceof HTMLVideoElement) trackVideo(node);
+    if (node && node.querySelectorAll) {
+      for (const video of node.querySelectorAll('video')) trackVideo(video);
+    }
+  };
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) scanVideos(node);
+    }
+  }).observe(document, {childList: true, subtree: true});
+  document.addEventListener('DOMContentLoaded', () => scanVideos(document));
+  window.__app16VideoFrameMetadataFor = video => videoFrameMetadata.get(video) || null;
+
   window.__app16MetadataByChannel = Object.create(null);
   const observedChannels = new WeakSet();
   const remoteHookedPeers = new WeakSet();
@@ -287,23 +325,29 @@ def sample_js(
       }
       if (temporalMarker) {
         const bitProbe = document.createElement('canvas');
-        bitProbe.width = temporalMarker.bits;
-        bitProbe.height = 1;
+        const stripWidth = (temporalMarker.bits - 1) * temporalMarker.bit_stride
+          + temporalMarker.bit_width;
+        bitProbe.width = stripWidth;
+        bitProbe.height = temporalMarker.bit_height;
         const bitCtx = bitProbe.getContext('2d', {willReadFrequently: true});
-        for (let bit = 0; bit < temporalMarker.bits; bit += 1) {
-          bitCtx.drawImage(
-            video,
-            temporalMarker.x + bit * temporalMarker.bit_stride,
-            temporalMarker.y,
-            temporalMarker.bit_width,
-            temporalMarker.bit_height,
-            bit, 0, 1, 1
-          );
-        }
-        const bitPixels = bitCtx.getImageData(0, 0, temporalMarker.bits, 1).data;
+        // One draw freezes the complete strip from one composited video frame.
+        // Per-bit drawImage calls can straddle two frames and synthesize a code
+        // that never existed in the source.
+        bitCtx.drawImage(
+          video,
+          temporalMarker.x, temporalMarker.y,
+          stripWidth, temporalMarker.bit_height,
+          0, 0, stripWidth, temporalMarker.bit_height
+        );
+        const bitPixels = bitCtx.getImageData(
+          0, 0, stripWidth, temporalMarker.bit_height
+        ).data;
         let code = 0;
         for (let bit = 0; bit < temporalMarker.bits; bit += 1) {
-          const offset = bit * 4;
+          const x = bit * temporalMarker.bit_stride
+            + Math.floor(temporalMarker.bit_width / 2);
+          const y = Math.floor(temporalMarker.bit_height / 2);
+          const offset = (y * stripWidth + x) * 4;
           const luma = 0.2126 * bitPixels[offset]
             + 0.7152 * bitPixels[offset + 1]
             + 0.0722 * bitPixels[offset + 2];
@@ -332,6 +376,8 @@ def sample_js(
       nonBlackSamples,
       identityRgb,
       temporalCode,
+      videoFrame: video && window.__app16VideoFrameMetadataFor
+        ? window.__app16VideoFrameMetadataFor(video) : null,
       metadata: channelId === null
         ? null
         : (window.__app16MetadataByChannel[channelId] || null),
@@ -492,8 +538,10 @@ def analyze_temporal_samples(
     sync_tolerance = float(temporal["sync_tolerance_frames"])
     codes = [sample.get("temporalCode") for sample in tile_samples]
     metadata = [sample.get("metadata") for sample in tile_samples]
+    video_frames = [sample.get("videoFrame") for sample in tile_samples]
     segments: list[dict[str, Any]] = []
-    offsets: list[int] = []
+    media_origin_offsets: list[int] = []
+    rtp_distances: list[int] = []
     all_codes_valid = all(isinstance(code, int) and 0 <= code < period for code in codes)
     all_metadata_valid = all(
         isinstance(row, dict)
@@ -502,12 +550,27 @@ def analyze_temporal_samples(
         and isinstance(row.get("rtpTimestamp"), (int, float))
         for row in metadata
     )
+    all_video_frames_valid = all(
+        isinstance(row, dict)
+        and isinstance(row.get("callbackCount"), (int, float))
+        and isinstance(row.get("rtpTimestamp"), (int, float))
+        for row in video_frames
+    )
 
     if all_codes_valid and all_metadata_valid:
         for code, row in zip(codes, metadata):
             pts_ns = int(row["ptsNs"])
             predicted_frame = round(pts_ns * fps / 1_000_000_000) % period
-            offsets.append((predicted_frame - int(code)) % period)
+            media_origin_offsets.append((predicted_frame - int(code)) % period)
+    if all_metadata_valid and all_video_frames_valid:
+        for metadata_row, video_row in zip(metadata, video_frames):
+            rtp_distances.append(
+                circular_distance(
+                    int(metadata_row["rtpTimestamp"]) & 0xFFFFFFFF,
+                    int(video_row["rtpTimestamp"]) & 0xFFFFFFFF,
+                    1 << 32,
+                )
+            )
 
     for index in range(1, len(tile_samples)):
         elapsed = sample_times[index] - sample_times[index - 1]
@@ -516,6 +579,7 @@ def analyze_temporal_samples(
         code_delta = None
         metadata_frame_delta = None
         metadata_count_delta = None
+        video_callback_delta = None
         rtp_matches_pts = False
         if all_codes_valid:
             code_delta = (int(codes[index]) - int(codes[index - 1])) % period
@@ -536,6 +600,10 @@ def analyze_temporal_samples(
                     1 << 32,
                 )
                 <= 1
+            )
+        if all_video_frames_valid:
+            video_callback_delta = int(video_frames[index]["callbackCount"]) - int(
+                video_frames[index - 1]["callbackCount"]
             )
         video_forward = (
             code_delta is not None
@@ -558,6 +626,7 @@ def analyze_temporal_samples(
                 "video_code_delta": code_delta,
                 "metadata_pts_frame_delta": metadata_frame_delta,
                 "metadata_count_delta": metadata_count_delta,
+                "video_callback_delta": video_callback_delta,
                 "rtp_matches_pts": rtp_matches_pts,
                 "video_forward": video_forward,
                 "metadata_forward": metadata_forward,
@@ -565,21 +634,33 @@ def analyze_temporal_samples(
             }
         )
 
-    offsets_stable = bool(offsets) and all(
-        circular_distance(offset, offsets[0], period) <= sync_tolerance for offset in offsets
+    media_origin_offset_stable = bool(media_origin_offsets) and all(
+        circular_distance(offset, media_origin_offsets[0], period) <= sync_tolerance
+        for offset in media_origin_offsets
     )
-    offsets_synced = bool(offsets) and all(
-        circular_distance(offset, 0, period) <= sync_tolerance for offset in offsets
+    video_callbacks_forward = all_video_frames_valid and bool(segments) and all(
+        isinstance(segment["video_callback_delta"], int)
+        and segment["video_callback_delta"] > 0
+        for segment in segments
+    )
+    rtp_sync_tolerance_ticks = round(sync_tolerance * 90000 / fps)
+    video_metadata_rtp_synced = bool(rtp_distances) and all(
+        distance <= rtp_sync_tolerance_ticks for distance in rtp_distances
     )
     return {
         "codes": codes,
         "metadata": metadata,
-        "pts_video_offsets_frames": offsets,
+        "video_frames": video_frames,
+        "media_origin_offsets_frames": media_origin_offsets,
+        "video_metadata_rtp_distances_ticks": rtp_distances,
+        "rtp_sync_tolerance_ticks": rtp_sync_tolerance_ticks,
         "segments": segments,
         "codes_valid": all_codes_valid,
         "metadata_valid": all_metadata_valid,
-        "pts_video_offset_stable": offsets_stable,
-        "pts_video_offset_synced": offsets_synced,
+        "video_frames_valid": all_video_frames_valid,
+        "media_origin_offset_stable": media_origin_offset_stable,
+        "video_callbacks_forward": video_callbacks_forward,
+        "video_metadata_rtp_synced": video_metadata_rtp_synced,
         "video_forward": all_codes_valid
         and bool(segments)
         and all(segment["video_forward"] for segment in segments),
@@ -590,8 +671,8 @@ def analyze_temporal_samples(
         and all_metadata_valid
         and bool(segments)
         and all(segment["passed"] for segment in segments)
-        and offsets_stable
-        and offsets_synced,
+        and video_callbacks_forward
+        and video_metadata_rtp_synced,
     }
 
 
@@ -747,15 +828,18 @@ def main() -> int:
                 record["temporal"] and record["temporal"]["video_forward"]
                 for record in records
             )
+            checks["all_video_frame_callbacks_forward"] = all(
+                record["temporal"] and record["temporal"]["video_callbacks_forward"]
+                for record in records
+            )
             checks["all_metadata_pts_rtp_forward"] = all(
                 record["temporal"]
                 and record["temporal"]["metadata_forward"]
                 for record in records
             )
-            checks["all_video_metadata_pts_synced"] = all(
+            checks["all_video_metadata_rtp_synced"] = all(
                 record["temporal"]
-                and record["temporal"]["pts_video_offset_stable"]
-                and record["temporal"]["pts_video_offset_synced"]
+                and record["temporal"]["video_metadata_rtp_synced"]
                 for record in records
             )
         summary = {
