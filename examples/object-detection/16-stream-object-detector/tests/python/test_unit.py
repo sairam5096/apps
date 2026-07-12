@@ -694,6 +694,77 @@ class TestRuntimeOptions:
 
 
 class TestHandoffGates:
+    def test_stability_gate_selects_current_metadata_owner_over_stale_video_peer(self):
+        gate = load_script_module("app16_insight_stability_gate")
+
+        def candidate(
+            peer_id: int,
+            browser_report_at: str,
+            metadata_sent_at: str | None,
+        ) -> dict:
+            metadata = {"messages_sent": peer_id * 100}
+            if metadata_sent_at is not None:
+                metadata["last_sent_at"] = metadata_sent_at
+            return {
+                "id": peer_id,
+                "active": True,
+                "connection_state": "connected",
+                "data_channel_state": "open",
+                "browser": {"inbound_rtp": {"frames_decoded": peer_id * 1000}},
+                "last_browser_report_at": browser_report_at,
+                "metadata": metadata,
+            }
+
+        stale_video_peer = candidate(
+            1,
+            "2026-07-12T23:10:05Z",
+            "2026-07-12T23:09:55Z",
+        )
+        current_metadata_owner = candidate(
+            2,
+            "2026-07-12T23:10:04Z",
+            "2026-07-12T23:10:06Z",
+        )
+        payload = {
+            "channels": [
+                {"channel": 7, "peers": [stale_video_peer, current_metadata_owner]}
+            ]
+        }
+
+        assert gate.selected_browser_peers(payload)[7]["id"] == 2
+
+    def test_stability_gate_falls_back_to_newest_browser_report_before_metadata(self):
+        gate = load_script_module("app16_insight_stability_gate")
+        payload = {
+            "channels": [
+                {
+                    "channel": 3,
+                    "peers": [
+                        {
+                            "id": 10,
+                            "active": True,
+                            "connection_state": "connected",
+                            "data_channel_state": "open",
+                            "browser": {"video": {}},
+                            "last_browser_report_at": "2026-07-12T23:10:04Z",
+                            "metadata": {"messages_sent": 0},
+                        },
+                        {
+                            "id": 11,
+                            "active": True,
+                            "connection_state": "connected",
+                            "data_channel_state": "open",
+                            "browser": {"video": {}},
+                            "last_browser_report_at": "2026-07-12T23:10:05Z",
+                            "metadata": {"messages_sent": 0},
+                        },
+                    ],
+                }
+            ]
+        }
+
+        assert gate.selected_browser_peers(payload)[3]["id"] == 11
+
     def test_stability_gate_accounts_for_target_rates(self):
         gate = load_script_module("app16_insight_stability_gate")
 

@@ -352,6 +352,13 @@ Those read-only APIs expose counters, not metadata payload PTS or decoded video 
 gate proves continuity and rate only; it must not be cited as proof of forward-only content or
 box/video synchronization. Use the controlled temporal gate above for those claims.
 
+Insight can temporarily report more than one active, connected browser peer after a visual target
+closes. An orphan peer may keep publishing newer video/browser statistics even though metadata is
+sent to a different peer. The stability gate therefore selects the open browser peer with the
+newest `metadata.last_sent_at`; before any candidate has received metadata, it falls back to
+`last_browser_report_at`. This prevents a stale video-only peer from hiding the actual metadata
+owner while retaining deterministic startup behavior.
+
 ```bash
 python3 stress/app16_insight_stability_gate.py \
   --base-url https://127.0.0.1:9900 \

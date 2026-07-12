@@ -80,6 +80,29 @@ def by_channel(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
     }
 
 
+def timestamp_sort_key(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return dt.datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
+
+
+def browser_peer_selection_key(peer: dict[str, Any]) -> tuple[Any, ...]:
+    metadata_at = timestamp_sort_key((peer.get("metadata") or {}).get("last_sent_at"))
+    browser_at = timestamp_sort_key(peer.get("last_browser_report_at"))
+    peer_id = peer.get("id")
+    return (
+        metadata_at is not None,
+        metadata_at if metadata_at is not None else float("-inf"),
+        browser_at is not None,
+        browser_at if browser_at is not None else float("-inf"),
+        peer_id if isinstance(peer_id, int) else -1,
+    )
+
+
 def selected_browser_peers(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
     selected: dict[int, dict[str, Any]] = {}
     for row in payload.get("channels", []):
@@ -92,9 +115,7 @@ def selected_browser_peers(payload: dict[str, Any]) -> dict[int, dict[str, Any]]
             and peer.get("browser")
         ]
         if candidates:
-            selected[int(row["channel"])] = max(
-                candidates, key=lambda peer: peer.get("last_browser_report_at", "")
-            )
+            selected[int(row["channel"])] = max(candidates, key=browser_peer_selection_key)
     return selected
 
 
