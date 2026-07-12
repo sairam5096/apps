@@ -223,9 +223,12 @@ python3 stress/app16_make_identity_fixtures.py \
 
 The generator adds both the stable channel marker and an LSB-first binary frame counter. It
 verifies every output with `ffprobe` (`h264`, requested caps/FPS, and `has_b_frames=0`), decodes
-the first temporal-code sequence back to `0..15`, and writes `identity-manifest.json`. Publish
-the matching file to each RTSP source; App16 channel 0 reads `src1`, channel 1 reads `src2`, and
-so on:
+the first temporal-code sequence back to `0..15`, measures each solid marker after H.264/YUV
+conversion, requires all decoded marker colors to remain unique, and writes those calibrated RGB
+values to `identity-manifest.json`. The manifest retains `intended_rgb` for provenance; `--dry-run`
+cannot decode an output and therefore reports deterministic intended pre-encode RGB explicitly.
+Publish the matching file to each RTSP source; App16 channel 0 reads `src1`, channel 1 reads `src2`,
+and so on:
 
 ```bash
 mkdir -p /tmp/app16-rtsp-pubs

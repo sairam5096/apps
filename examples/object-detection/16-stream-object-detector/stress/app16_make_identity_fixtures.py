@@ -193,6 +193,43 @@ def verify_temporal_prefix(args: argparse.Namespace, output: Path, bits: int) ->
         raise RuntimeError(f"{output}: temporal marker prefix mismatch: {decoded}")
 
 
+def measure_decoded_marker_rgb(
+    args: argparse.Namespace,
+    output: Path,
+    marker: dict[str, int],
+    sample_frames: int = 8,
+) -> list[int]:
+    """Measure the marker after H.264/YUV conversion, not its requested RGB."""
+    command = [
+        args.ffmpeg,
+        "-v",
+        "error",
+        "-i",
+        str(output),
+        "-vf",
+        f"crop={marker['width']}:{marker['height']}:{marker['x']}:{marker['y']}",
+        "-frames:v",
+        str(sample_frames),
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    raw = subprocess.check_output(command)
+    frame_bytes = marker["width"] * marker["height"] * 3
+    if not raw or len(raw) % frame_bytes != 0:
+        raise RuntimeError(f"{output}: decoded marker returned {len(raw)} bytes")
+    pixels = len(raw) // 3
+    return [round(sum(raw[channel::3]) / pixels) for channel in range(3)]
+
+
+def require_unique_marker_colors(channels: dict[str, dict[str, object]]) -> None:
+    colors = [tuple(row["rgb"]) for row in channels.values()]
+    if len(set(colors)) != len(colors):
+        raise RuntimeError("decoded channel marker RGB values are not unique")
+
+
 def main() -> int:
     args = parse_args()
     if not args.dry_run:
@@ -210,6 +247,7 @@ def main() -> int:
         channel: args.output_dir / f"channel-{channel:02d}-{args.width}x{args.height}p{args.fps}-no-b.mp4"
         for channel in args.channel_ids
     }
+    marker = {"x": 8, "y": 8, "width": 24, "height": 24}
     manifest = {
         "version": 1,
         "description": "App16 real-moving fixtures with stable per-channel color and text markers",
@@ -217,7 +255,12 @@ def main() -> int:
         "height": args.height,
         "fps": args.fps,
         # This patch is inside the solid box but outside the human-readable CHxx text.
-        "marker": {"x": 8, "y": 8, "width": 24, "height": 24},
+        "marker": marker,
+        "marker_rgb_basis": (
+            "intended-pre-encode-dry-run"
+            if args.dry_run
+            else "mean-decoded-rgb24-first-8-frames"
+        ),
         "temporal": {
             "x": 8,
             "y": 70,
@@ -232,7 +275,11 @@ def main() -> int:
         },
         "tolerance": 45.0,
         "channels": {
-            str(channel): {"rgb": colors[channel], "file": outputs[channel].name}
+            str(channel): {
+                "rgb": colors[channel],
+                "intended_rgb": colors[channel],
+                "file": outputs[channel].name,
+            }
             for channel in args.channel_ids
         },
     }
@@ -244,6 +291,11 @@ def main() -> int:
             subprocess.run(command, check=True)
             verify_output(args, outputs[channel])
             verify_temporal_prefix(args, outputs[channel], temporal_bits)
+            manifest["channels"][str(channel)]["rgb"] = measure_decoded_marker_rgb(
+                args, outputs[channel], marker
+            )
+
+    require_unique_marker_colors(manifest["channels"])
 
     manifest_path = args.output_dir / "identity-manifest.json"
     if args.dry_run:

@@ -889,7 +889,7 @@ class TestHandoffGates:
 
     def test_identity_fixture_plan_is_unique_and_forces_no_b_frames(self):
         fixture = load_script_module("app16_make_identity_fixtures")
-        colors = fixture.channel_colors(list(range(24)))
+        colors = fixture.channel_colors(list(range(48)))
         args = SimpleNamespace(
             ffmpeg="ffmpeg",
             overwrite=True,
@@ -904,12 +904,37 @@ class TestHandoffGates:
             args, 7, colors[7], Path("channel-07-1280x720p20-no-b.mp4")
         )
 
-        assert len({tuple(rgb) for rgb in colors.values()}) == 24
+        assert len({tuple(rgb) for rgb in colors.values()}) == 48
         assert command[command.index("-bf") + 1] == "0"
         assert "bframes=0" in command[command.index("-x264-params") + 1]
         assert "text=CH07" in command[command.index("-vf") + 1]
         assert "floor(t*20)" in command[command.index("-vf") + 1]
         assert "enable=" in command[command.index("-vf") + 1]
+
+    def test_identity_fixture_calibrates_decoded_marker_rgb(self, monkeypatch):
+        fixture = load_script_module("app16_make_identity_fixtures")
+        args = SimpleNamespace(ffmpeg="ffmpeg")
+        marker = {"x": 8, "y": 8, "width": 2, "height": 1}
+        captured = []
+
+        def fake_check_output(command):
+            captured.append(command)
+            return bytes([10, 20, 30, 30, 40, 50])
+
+        monkeypatch.setattr(fixture.subprocess, "check_output", fake_check_output)
+        assert fixture.measure_decoded_marker_rgb(
+            args, Path("encoded.mp4"), marker, sample_frames=1
+        ) == [20, 30, 40]
+        assert "crop=2:1:8:8" in captured[0]
+
+        unique = {
+            str(channel): {"rgb": rgb}
+            for channel, rgb in fixture.channel_colors(list(range(48))).items()
+        }
+        fixture.require_unique_marker_colors(unique)
+        unique["47"]["rgb"] = unique["0"]["rgb"]
+        with pytest.raises(RuntimeError, match="not unique"):
+            fixture.require_unique_marker_colors(unique)
 
 
 class FakeMetadataSender:
