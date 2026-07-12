@@ -97,10 +97,12 @@ bool test_validate_config_only_accepts_twenty_four_streams(const std::string& bi
       expect_contains(result.stdout_text, "streams=24",
                       "validate output reports default stream count") &&
       expect_contains(result.stdout_text, "workers=1", "validate output reports worker count") &&
+      expect_contains(result.stdout_text, "queue_depth=4",
+                      "validate output reports the proven detector queue default") &&
       expect_contains(result.stdout_text, "internal_queue_depth=1",
                       "validate output reports the bounded global stage queue default") &&
-      expect_contains(result.stdout_text, "max_inflight_per_stream=1",
-                      "validate output reports the public per-stream credit default") &&
+      expect_contains(result.stdout_text, "max_inflight_per_stream=4",
+                      "validate output reports the proven public per-stream credit default") &&
       expect_contains(result.stdout_text,
                       (config_path.parent_path() / kModelPath).lexically_normal().string(),
                       "relative model path resolves from the config directory") &&

@@ -47,9 +47,9 @@ runtime:                     # Runtime and profiling settings.
 
 inference:                   # Detection controls.
   workers: 1                 # One shared detector graph avoids dispatcher/resource contention.
-  queue_depth: 1             # Realtime latest-frame queueing keeps the 24-camera live view current.
-  internal_queue_depth: 1    # Current handoff candidate; re-confirm with final clean-install 24x20 gate.
-  max_inflight_per_stream: 1 # Public per-stream mux credit; tune 1..4 and pin only from 24x20 evidence.
+  queue_depth: 4             # Proven latest-frame link depth for the 24x20 profile.
+  internal_queue_depth: 1    # One global model-stage handoff; not a per-camera decoded queue.
+  max_inflight_per_stream: 4 # Proven per-stream mux credit for approximately 20 detections/s.
   min_score: 0.30            # Detection score threshold used by the validated Insight run.
   nms_iou: 0.60              # NMS IOU threshold.
   max_detections: 50         # Max detections to keep per frame after NMS.

@@ -50,10 +50,12 @@ caps, deque, and metadata bookkeeping add a small amount of ordinary CPU memory.
 this queue consumes EV74 memory.
 
 The checked-in decoder configuration is 16 output surfaces and two compressed-input buffers
-per stream. Those are codec pool surfaces, not application staging queues. The detector link
-admits one decoded frame per stream. `inference.internal_queue_depth` remains an explicit
-tuning input; the checked-in value is the current handoff candidate, not a claim that depth one
-or two is universally optimal. Pin the final value only after the clean-install 24×20 gate.
+per stream. Those are codec pool surfaces, not application staging queues. The proven detector
+settings are link depth 4, one global internal model-stage handoff, and four latest-mux credits per
+stream. In the controlled 24×20 tuning run, the earlier depth/credit-one profile produced a median
+17.0 detections/s per stream; `queue_depth=4`, `internal_queue_depth=1`, and
+`max_inflight_per_stream=4` produced 19.91 with zero encoded-video queue rejects. These are now
+defaults rather than unpinned tuning candidates.
 
 PTS is matched within an epoch rather than as one never-ending numeric timeline. The ordered,
 no-B-frame encoded branch is the only authority that starts a new epoch after a large backward
@@ -107,8 +109,8 @@ From the Apps repository root:
 The config check should report:
 
 ```text
-streams=24, model_path=..., labels_path=..., workers=1, queue_depth=1, internal_queue_depth=1,
-max_inflight_per_stream=1,
+streams=24, model_path=..., labels_path=..., workers=1, queue_depth=4, internal_queue_depth=1,
+max_inflight_per_stream=4,
 insight_visible_streams=24, sync_delay_ms=400, decoder_admission=core
 ```
 
@@ -125,13 +127,12 @@ Important YAML settings:
 - `input.skip_rtsp_probe: true` requires correct width, height, and FPS.
 - `input.drop_on_latency: true` prevents a stale RTSP backlog.
 - `inference.workers` must be `1`.
-- `inference.queue_depth: 1` keeps the per-stream detector input current.
+- `inference.queue_depth: 4` is the proven latest-frame detector-link depth for 24×20.
 - `inference.internal_queue_depth` is a small global model-stage handoff, not a per-camera
-  decoded-frame queue. Keep it explicit and confirm it with the final 24×20 clean-install run.
-- `inference.max_inflight_per_stream` is the public latest-mux credit for each camera. Keep the
-  checked-in safety value until measuring 1, 2, 3, and 4 on the clean 24×20 install; then pin the
-  winner that sustains approximately 20 detections/s per channel without stale boxes or EV74
-  pressure. Do not replace this setting with a private environment override.
+  decoded-frame queue. The proven value is `1`.
+- `inference.max_inflight_per_stream: 4` is the proven public latest-mux credit for each camera.
+  Together these settings sustained approximately 20 detections/s per channel without encoded
+  video rejects. Do not replace them with private environment overrides.
 - `output.insight.max_visible_streams` publishes the first N configured streams. Streams after
   N still run inference but intentionally have no Insight video or metadata sender. Set it to
   the stream count for acceptance. Core's encoded callback is graph-global: with partial
@@ -245,19 +246,25 @@ marker, the gate samples it seven times by default and also requires:
   forward at the requested rate (backward/repeated content fails without per-bit tearing);
 - metadata message count and metadata PTS-derived frame code to advance on every segment;
 - metadata `rtp_timestamp` to equal the 90 kHz value derived from its PTS; and
-- the displayed frame's browser `VideoFrameMetadata.rtpTimestamp` and App metadata
-  `rtp_timestamp` to remain within `sync_tolerance_frames * 90000 / fps` ticks. A stale or large
-  RTP lag fails, as do stale repeated boxes.
+- the tile's live inbound RTP timestamp from
+  `RTCRtpReceiver.getSynchronizationSources()` and App metadata `rtp_timestamp` to remain within
+  `sync_tolerance_frames * 90000 / fps` ticks. A stale or large RTP lag fails, as do stale
+  repeated boxes. The gate falls back to `VideoFrameMetadata.rtpTimestamp` on browsers that expose
+  it.
 
 The fixture frame code and pipeline PTS can have an arbitrary channel-specific origin offset when
 the publisher was already running before App16 joined. The gate records that offset and its
-stability as a diagnostic but never requires it to be near zero; direct displayed-video/metadata
-RTP distance is the synchronization authority.
+stability as a diagnostic but never requires it to be near zero; live inbound-video/metadata RTP
+distance is the synchronization authority. Receiver synchronization sources describe the
+latest inbound packet rather than necessarily the exact frame currently presented; the configured
+frame tolerance deliberately bounds this packet-versus-presentation lead while the temporal code
+separately proves displayed-frame direction and freshness.
 
 The pre-document hook observes both viewer-created DataChannels and remotely created channels
 delivered through the browser's `datachannel` event, before Insight installs its own handler. It
 also starts a `requestVideoFrameCallback` loop for each video tile and retains the latest presented
-frame RTP timestamp and callback count.
+frame callback count. It maps each tile's `MediaStreamTrack` back to its peer receiver to sample
+the inbound RTP timestamp even when Chrome omits RTP from `VideoFrameMetadata`.
 
 Insight currently assigns each channel's metadata DataChannel to one viewer. Close the
 operator viewer before this active gate, then refresh it after the gate closes. Running two

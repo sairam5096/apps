@@ -134,8 +134,8 @@ class TestConfigLoading:
         assert cfg.decode_type == "yolo26"
         assert len(cfg.rtsp_urls) == 24
         assert cfg.workers == 1
-        assert cfg.queue_depth == 1
-        assert cfg.max_inflight_per_stream == 1
+        assert cfg.queue_depth == 4
+        assert cfg.max_inflight_per_stream == 4
         assert cfg.skip_rtsp_probe is True
         assert cfg.input_width == 1280
         assert cfg.input_height == 720
@@ -426,7 +426,7 @@ output:
         assert "streams=2" in result.stdout
         assert "workers=1" in result.stdout
         assert "queue_depth=4" in result.stdout
-        assert "max_inflight_per_stream=1" in result.stdout
+        assert "max_inflight_per_stream=4" in result.stdout
         assert "insight_visible_streams=2" in result.stdout
         assert "decoder_admission=core" in result.stdout
 
@@ -579,7 +579,7 @@ class TestRuntimeOptions:
         assert link.policy == "latest-by-stream"
         assert link.queue_depth == 3
         assert link.stream_id == "stream7"
-        assert link.max_inflight_per_stream == 1
+        assert link.max_inflight_per_stream == 4
 
         tuned = main.graph_realtime_link(3, "stream7", 4)
         assert tuned.max_inflight_per_stream == 4
@@ -696,7 +696,11 @@ class TestHandoffGates:
                 "metadata": row,
                 "videoFrame": {
                     "callbackCount": callback_count,
+                    "rtpTimestamp": None,
+                },
+                "videoRtp": {
                     "rtpTimestamp": (row["rtpTimestamp"] + rtp_lag) & 0xFFFFFFFF,
+                    "source": "receiver-synchronization-source",
                 },
             }
 
@@ -742,6 +746,7 @@ class TestHandoffGates:
         assert "addEventListener('datachannel'" in gate.CANVAS_HOOK_JS
         assert "setRemoteDescription" in gate.CANVAS_HOOK_JS
         assert "requestVideoFrameCallback" in gate.CANVAS_HOOK_JS
+        assert "window.__app16Peers.push(this)" in gate.CANVAS_HOOK_JS
 
         temporal = {
             "x": 8,
@@ -757,6 +762,9 @@ class TestHandoffGates:
         }
         sample_script = gate.sample_js([0], None, temporal)
         assert sample_script.count("bitCtx.drawImage(") == 1
+        assert "getReceivers()" in sample_script
+        assert "getSynchronizationSources()" in sample_script
+        assert "presented-video-frame" in sample_script
 
     def test_identity_fixture_plan_is_unique_and_forces_no_b_frames(self):
         fixture = load_script_module("app16_make_identity_fixtures")

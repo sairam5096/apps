@@ -204,6 +204,7 @@ CANVAS_HOOK_JS = r"""
   window.__app16VideoFrameMetadataFor = video => videoFrameMetadata.get(video) || null;
 
   window.__app16MetadataByChannel = Object.create(null);
+  window.__app16Peers = [];
   const observedChannels = new WeakSet();
   const remoteHookedPeers = new WeakSet();
   const observeMetadataChannel = channel => {
@@ -242,6 +243,7 @@ CANVAS_HOOK_JS = r"""
   pcProto.setRemoteDescription = function(...args) {
     if (!remoteHookedPeers.has(this)) {
       remoteHookedPeers.add(this);
+      window.__app16Peers.push(this);
       this.addEventListener('datachannel', event => {
         observeMetadataChannel(event.channel);
       });
@@ -362,6 +364,39 @@ def sample_js(
       ? quality.totalVideoFrames
       : (video && Number.isFinite(video.webkitDecodedFrameCount)
           ? video.webkitDecodedFrameCount : null);
+    const presentedFrame = video && window.__app16VideoFrameMetadataFor
+      ? window.__app16VideoFrameMetadataFor(video) : null;
+    let videoRtp = null;
+    if (video && video.srcObject && video.srcObject.getVideoTracks) {
+      const track = video.srcObject.getVideoTracks()[0] || null;
+      if (track) {
+        for (const pc of (window.__app16Peers || [])) {
+          const receiver = pc.getReceivers().find(candidate => candidate.track === track);
+          if (!receiver || !receiver.getSynchronizationSources) continue;
+          const sources = receiver.getSynchronizationSources();
+          const latest = sources.reduce((selected, source) => {
+            if (!Number.isFinite(source.rtpTimestamp)) return selected;
+            if (!selected || Number(source.timestamp) > Number(selected.timestamp)) return source;
+            return selected;
+          }, null);
+          if (latest) {
+            videoRtp = {
+              rtpTimestamp: latest.rtpTimestamp,
+              sourceTimestamp: Number.isFinite(latest.timestamp) ? latest.timestamp : null,
+              source: 'receiver-synchronization-source',
+            };
+            break;
+          }
+        }
+      }
+    }
+    if (!videoRtp && presentedFrame && Number.isFinite(presentedFrame.rtpTimestamp)) {
+      videoRtp = {
+        rtpTimestamp: presentedFrame.rtpTimestamp,
+        sourceTimestamp: null,
+        source: 'presented-video-frame',
+      };
+    }
     return {
       index,
       expectedChannelId: expected[index] ?? null,
@@ -376,8 +411,8 @@ def sample_js(
       nonBlackSamples,
       identityRgb,
       temporalCode,
-      videoFrame: video && window.__app16VideoFrameMetadataFor
-        ? window.__app16VideoFrameMetadataFor(video) : null,
+      videoFrame: presentedFrame,
+      videoRtp,
       metadata: channelId === null
         ? null
         : (window.__app16MetadataByChannel[channelId] || null),
@@ -539,6 +574,7 @@ def analyze_temporal_samples(
     codes = [sample.get("temporalCode") for sample in tile_samples]
     metadata = [sample.get("metadata") for sample in tile_samples]
     video_frames = [sample.get("videoFrame") for sample in tile_samples]
+    video_rtp = [sample.get("videoRtp") for sample in tile_samples]
     segments: list[dict[str, Any]] = []
     media_origin_offsets: list[int] = []
     rtp_distances: list[int] = []
@@ -553,8 +589,11 @@ def analyze_temporal_samples(
     all_video_frames_valid = all(
         isinstance(row, dict)
         and isinstance(row.get("callbackCount"), (int, float))
-        and isinstance(row.get("rtpTimestamp"), (int, float))
         for row in video_frames
+    )
+    all_video_rtp_valid = all(
+        isinstance(row, dict) and isinstance(row.get("rtpTimestamp"), (int, float))
+        for row in video_rtp
     )
 
     if all_codes_valid and all_metadata_valid:
@@ -562,8 +601,8 @@ def analyze_temporal_samples(
             pts_ns = int(row["ptsNs"])
             predicted_frame = round(pts_ns * fps / 1_000_000_000) % period
             media_origin_offsets.append((predicted_frame - int(code)) % period)
-    if all_metadata_valid and all_video_frames_valid:
-        for metadata_row, video_row in zip(metadata, video_frames):
+    if all_metadata_valid and all_video_rtp_valid:
+        for metadata_row, video_row in zip(metadata, video_rtp):
             rtp_distances.append(
                 circular_distance(
                     int(metadata_row["rtpTimestamp"]) & 0xFFFFFFFF,
@@ -651,6 +690,7 @@ def analyze_temporal_samples(
         "codes": codes,
         "metadata": metadata,
         "video_frames": video_frames,
+        "video_rtp": video_rtp,
         "media_origin_offsets_frames": media_origin_offsets,
         "video_metadata_rtp_distances_ticks": rtp_distances,
         "rtp_sync_tolerance_ticks": rtp_sync_tolerance_ticks,
@@ -658,6 +698,7 @@ def analyze_temporal_samples(
         "codes_valid": all_codes_valid,
         "metadata_valid": all_metadata_valid,
         "video_frames_valid": all_video_frames_valid,
+        "video_rtp_valid": all_video_rtp_valid,
         "media_origin_offset_stable": media_origin_offset_stable,
         "video_callbacks_forward": video_callbacks_forward,
         "video_metadata_rtp_synced": video_metadata_rtp_synced,

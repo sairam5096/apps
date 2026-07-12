@@ -55,9 +55,9 @@ namespace {
 constexpr int kStreamLimit = 80;
 constexpr int kDefaultInitialDetectionTimeoutMs = 30000;
 constexpr int kDetectorResultTimeoutMs = 5000;
-constexpr int kDefaultQueueDepth = 1;
+constexpr int kDefaultQueueDepth = 4;
 constexpr int kDefaultInternalQueueDepth = 1;
-constexpr int kDefaultMaxInflightPerStream = 1;
+constexpr int kDefaultMaxInflightPerStream = 4;
 constexpr int kDefaultDecoderBuffers = 16;
 constexpr int kDefaultDecoderInputBuffers = 2;
 constexpr int kAllInsightStreams = -1;
