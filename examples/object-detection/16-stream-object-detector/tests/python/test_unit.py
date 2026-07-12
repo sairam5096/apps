@@ -689,7 +689,7 @@ class TestHandoffGates:
                 "rtpTimestamp": (pts_ns * 90000 // 1_000_000_000) & 0xFFFFFFFF,
             }
 
-        def sample(code: int, frame: int, count: int, callback_count: int, rtp_lag=0):
+        def sample(code: int, frame: int, count: int, callback_count: int, rtp_translation=0):
             row = metadata(frame, count)
             return {
                 "temporalCode": code,
@@ -699,48 +699,61 @@ class TestHandoffGates:
                     "rtpTimestamp": None,
                 },
                 "videoRtp": {
-                    "rtpTimestamp": (row["rtpTimestamp"] + rtp_lag) & 0xFFFFFFFF,
+                    "rtpTimestamp": (row["rtpTimestamp"] + rtp_translation) & 0xFFFFFFFF,
                     "source": "receiver-synchronization-source",
                 },
             }
 
         # The publisher was already 40 seconds (800 frames) into the fixture
-        # when App16 joined. This stable media-origin offset is legitimate;
-        # direct video/metadata RTP equality is the synchronization authority.
+        # when App16 joined, and WebRTC applied an arbitrary RTP translation.
+        # Both stable offsets are legitimate; translation drift is not.
+        rtp_translation = 1_100_000_000
         forward = [
-            sample(0, 800, 10, 10),
-            sample(20, 820, 30, 30),
-            sample(40, 840, 50, 50),
+            sample(0, 800, 10, 10, rtp_translation),
+            sample(20, 820, 30, 30, rtp_translation),
+            sample(40, 840, 50, 50, rtp_translation),
         ]
         forward_result = gate.analyze_temporal_samples(
             forward, [0.0, 1.0, 2.0], temporal
         )
         assert forward_result["media_origin_offset_stable"]
         assert forward_result["media_origin_offsets_frames"] == [800, 800, 800]
-        assert forward_result["video_metadata_rtp_synced"]
+        assert forward_result["video_metadata_rtp_translation_baseline"] == rtp_translation
+        assert forward_result["video_metadata_rtp_translation_deviations"] == [0, 0, 0]
+        assert forward_result["video_metadata_rtp_translation_range_ticks"] == 0
+        assert forward_result["video_metadata_rtp_translation_stable"]
         assert forward_result["passed"]
 
-        backward = [forward[0], forward[1], sample(10, 840, 50, 50)]
+        backward = [
+            forward[0],
+            forward[1],
+            sample(10, 840, 50, 50, rtp_translation),
+        ]
         assert not gate.analyze_temporal_samples(backward, [0.0, 1.0, 2.0], temporal)[
             "passed"
         ]
 
-        stale = [forward[0], forward[1], sample(40, 820, 30, 50, rtp_lag=20 * 4500)]
+        stale = [
+            forward[0],
+            forward[1],
+            sample(40, 820, 30, 50, rtp_translation + 20 * 4500),
+        ]
         assert not gate.analyze_temporal_samples(stale, [0.0, 1.0, 2.0], temporal)["passed"]
 
-        large_rtp_mismatch = [
-            sample(0, 800, 10, 10, rtp_lag=100 * 4500),
-            sample(20, 820, 30, 30, rtp_lag=100 * 4500),
-            sample(40, 840, 50, 50, rtp_lag=100 * 4500),
+        rtp_translation_jump = [
+            forward[0],
+            forward[1],
+            sample(40, 840, 50, 50, rtp_translation + 100 * 4500),
         ]
         mismatch_result = gate.analyze_temporal_samples(
-            large_rtp_mismatch, [0.0, 1.0, 2.0], temporal
+            rtp_translation_jump, [0.0, 1.0, 2.0], temporal
         )
         assert mismatch_result["media_origin_offset_stable"]
-        assert not mismatch_result["video_metadata_rtp_synced"]
+        assert mismatch_result["video_metadata_rtp_translation_range_ticks"] == 100 * 4500
+        assert not mismatch_result["video_metadata_rtp_translation_stable"]
         assert not mismatch_result["passed"]
 
-    def test_visual_gate_hooks_local_and_remote_data_channels(self):
+    def test_visual_gate_hooks_local_and_remote_data_channels(self, monkeypatch):
         gate = load_script_module("app16_insight_visual_gate")
         assert "createDataChannel" in gate.CANVAS_HOOK_JS
         assert "addEventListener('datachannel'" in gate.CANVAS_HOOK_JS
@@ -765,6 +778,18 @@ class TestHandoffGates:
         assert "getReceivers()" in sample_script
         assert "getSynchronizationSources()" in sample_script
         assert "presented-video-frame" in sample_script
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "app16_insight_visual_gate.py",
+                "--viewer-url",
+                "https://viewer",
+                "--keep-target-on-success",
+            ],
+        )
+        assert gate.parse_args().keep_target_on_success
 
     def test_identity_fixture_plan_is_unique_and_forces_no_b_frames(self):
         fixture = load_script_module("app16_make_identity_fixtures")

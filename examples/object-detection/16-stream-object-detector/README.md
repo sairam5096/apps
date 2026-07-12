@@ -246,19 +246,20 @@ marker, the gate samples it seven times by default and also requires:
   forward at the requested rate (backward/repeated content fails without per-bit tearing);
 - metadata message count and metadata PTS-derived frame code to advance on every segment;
 - metadata `rtp_timestamp` to equal the 90 kHz value derived from its PTS; and
-- the tile's live inbound RTP timestamp from
-  `RTCRtpReceiver.getSynchronizationSources()` and App metadata `rtp_timestamp` to remain within
-  `sync_tolerance_frames * 90000 / fps` ticks. A stale or large RTP lag fails, as do stale
-  repeated boxes. The gate falls back to `VideoFrameMetadata.rtpTimestamp` on browsers that expose
-  it.
+- the circular translation offset between the tile's live inbound RTP timestamp from
+  `RTCRtpReceiver.getSynchronizationSources()` and App metadata `rtp_timestamp` to remain stable
+  within `sync_tolerance_frames * 90000 / fps` ticks. The gate records the baseline, deviations,
+  and range; a large drift/jump fails. It falls back to `VideoFrameMetadata.rtpTimestamp` on
+  browsers that expose it.
 
 The fixture frame code and pipeline PTS can have an arbitrary channel-specific origin offset when
-the publisher was already running before App16 joined. The gate records that offset and its
-stability as a diagnostic but never requires it to be near zero; live inbound-video/metadata RTP
-distance is the synchronization authority. Receiver synchronization sources describe the
-latest inbound packet rather than necessarily the exact frame currently presented; the configured
-frame tolerance deliberately bounds this packet-versus-presentation lead while the temporal code
-separately proves displayed-frame direction and freshness.
+the publisher was already running before App16 joined. WebRTC also applies a random per-peer RTP
+timestamp translation, so neither offset is required to be near zero. Focused queue tests prove
+that App16 releases metadata against the exact source PTS. The runtime gate proves that video and
+metadata both advance without relative RTP drift while the temporal code independently proves
+displayed-frame direction and freshness. Receiver synchronization sources describe the latest
+inbound packet rather than necessarily the exact frame presented, so this is an explicit
+no-drift inference with a frame tolerance, not a claim of absolute browser presentation skew.
 
 The pre-document hook observes both viewer-created DataChannels and remotely created channels
 delivered through the browser's `datachannel` event, before Insight installs its own handler. It
@@ -299,14 +300,18 @@ python3 stress/app16_insight_visual_gate.py \
   --layout 24 --expected-fps 20 --width 1280 --height 720 \
   --identity-manifest /root/.simaai/neat-insight/media/app16/identity-24x20/identity-manifest.json \
   --wait-seconds 30 --sample-seconds 1860 --temporal-samples 373 \
+  --keep-target-on-success \
   --output-prefix runs/app16-temporal-sync-24x20-30m
 ```
 
 Run that command in the background, wait until Insight reports all 24 peers, and start the
 read-only gate below while the dedicated target remains open. Do not open an operator viewer at
 the same time. The read-only gate then observes this same dedicated browser peer without owning a
-second DataChannel. The controlled gate closes its target afterward; refresh the operator viewer
-only after both commands exit.
+second DataChannel. With `--keep-target-on-success`, a passing gate detaches from the dedicated
+viewer and leaves it visible as the sole metadata owner. The summary reports `dedicated_target_id`
+and `target_kept_open`; close that target manually before opening another viewer. Without the
+option, and on every failure path, the gate closes its target automatically; refresh the operator
+viewer only after both commands exit.
 
 ### 2. Read-only 30-minute stability gate
 

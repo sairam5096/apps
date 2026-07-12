@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("insight-visual-gate"),
         help="output path without .json or .png suffix",
     )
+    parser.add_argument(
+        "--keep-target-on-success",
+        action="store_true",
+        help="leave the dedicated viewer target open after a passing gate",
+    )
     args = parser.parse_args()
     if args.layout <= 0 or args.width <= 0 or args.height <= 0:
         parser.error("--layout and dimensions must be positive")
@@ -563,6 +568,11 @@ def circular_distance(lhs: int, rhs: int, modulus: int) -> int:
     return min(delta, modulus - delta)
 
 
+def signed_circular_delta(value: int, baseline: int, modulus: int) -> int:
+    delta = (value - baseline) % modulus
+    return delta - modulus if delta >= modulus // 2 else delta
+
+
 def analyze_temporal_samples(
     tile_samples: list[dict[str, Any]],
     sample_times: list[float],
@@ -577,7 +587,7 @@ def analyze_temporal_samples(
     video_rtp = [sample.get("videoRtp") for sample in tile_samples]
     segments: list[dict[str, Any]] = []
     media_origin_offsets: list[int] = []
-    rtp_distances: list[int] = []
+    rtp_translation_offsets: list[int] = []
     all_codes_valid = all(isinstance(code, int) and 0 <= code < period for code in codes)
     all_metadata_valid = all(
         isinstance(row, dict)
@@ -603,12 +613,12 @@ def analyze_temporal_samples(
             media_origin_offsets.append((predicted_frame - int(code)) % period)
     if all_metadata_valid and all_video_rtp_valid:
         for metadata_row, video_row in zip(metadata, video_rtp):
-            rtp_distances.append(
-                circular_distance(
-                    int(metadata_row["rtpTimestamp"]) & 0xFFFFFFFF,
-                    int(video_row["rtpTimestamp"]) & 0xFFFFFFFF,
-                    1 << 32,
+            rtp_translation_offsets.append(
+                (
+                    int(video_row["rtpTimestamp"])
+                    - int(metadata_row["rtpTimestamp"])
                 )
+                & 0xFFFFFFFF
             )
 
     for index in range(1, len(tile_samples)):
@@ -683,8 +693,20 @@ def analyze_temporal_samples(
         for segment in segments
     )
     rtp_sync_tolerance_ticks = round(sync_tolerance * 90000 / fps)
-    video_metadata_rtp_synced = bool(rtp_distances) and all(
-        distance <= rtp_sync_tolerance_ticks for distance in rtp_distances
+    rtp_translation_baseline = (
+        rtp_translation_offsets[0] if rtp_translation_offsets else None
+    )
+    rtp_translation_deviations = (
+        [
+            signed_circular_delta(offset, rtp_translation_baseline, 1 << 32)
+            for offset in rtp_translation_offsets
+        ]
+        if rtp_translation_baseline is not None
+        else []
+    )
+    rtp_translation_stable = bool(rtp_translation_deviations) and all(
+        abs(deviation) <= rtp_sync_tolerance_ticks
+        for deviation in rtp_translation_deviations
     )
     return {
         "codes": codes,
@@ -692,7 +714,14 @@ def analyze_temporal_samples(
         "video_frames": video_frames,
         "video_rtp": video_rtp,
         "media_origin_offsets_frames": media_origin_offsets,
-        "video_metadata_rtp_distances_ticks": rtp_distances,
+        "video_metadata_rtp_translation_offsets": rtp_translation_offsets,
+        "video_metadata_rtp_translation_baseline": rtp_translation_baseline,
+        "video_metadata_rtp_translation_deviations": rtp_translation_deviations,
+        "video_metadata_rtp_translation_range_ticks": (
+            max(rtp_translation_deviations) - min(rtp_translation_deviations)
+            if rtp_translation_deviations
+            else None
+        ),
         "rtp_sync_tolerance_ticks": rtp_sync_tolerance_ticks,
         "segments": segments,
         "codes_valid": all_codes_valid,
@@ -701,7 +730,7 @@ def analyze_temporal_samples(
         "video_rtp_valid": all_video_rtp_valid,
         "media_origin_offset_stable": media_origin_offset_stable,
         "video_callbacks_forward": video_callbacks_forward,
-        "video_metadata_rtp_synced": video_metadata_rtp_synced,
+        "video_metadata_rtp_translation_stable": rtp_translation_stable,
         "video_forward": all_codes_valid
         and bool(segments)
         and all(segment["video_forward"] for segment in segments),
@@ -713,7 +742,7 @@ def analyze_temporal_samples(
         and bool(segments)
         and all(segment["passed"] for segment in segments)
         and video_callbacks_forward
-        and video_metadata_rtp_synced,
+        and rtp_translation_stable,
     }
 
 
@@ -729,6 +758,7 @@ def main() -> int:
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
     target = DedicatedTarget(args.cdp_host, args.cdp_port)
+    keep_target = False
     try:
         cdp = target.cdp
         cdp.call("Page.enable")
@@ -878,9 +908,9 @@ def main() -> int:
                 and record["temporal"]["metadata_forward"]
                 for record in records
             )
-            checks["all_video_metadata_rtp_synced"] = all(
+            checks["all_video_metadata_rtp_translation_stable"] = all(
                 record["temporal"]
-                and record["temporal"]["video_metadata_rtp_synced"]
+                and record["temporal"]["video_metadata_rtp_translation_stable"]
                 for record in records
             )
         summary = {
@@ -907,7 +937,10 @@ def main() -> int:
             "temporal_marker": temporal_marker,
             "checks": checks,
             "passed": all(checks.values()),
+            "dedicated_target_id": target.id,
         }
+        keep_on_success = args.keep_target_on_success and summary["passed"]
+        summary["target_kept_open"] = keep_on_success
         payload = {
             "summary": summary,
             "records": records,
@@ -918,9 +951,13 @@ def main() -> int:
             json.dumps(payload, indent=2) + "\n", encoding="utf-8"
         )
         print(json.dumps(summary, sort_keys=True))
+        keep_target = keep_on_success
         return 0 if summary["passed"] else 1
     finally:
-        target.close()
+        if keep_target:
+            target.cdp.close()
+        else:
+            target.close()
 
 
 if __name__ == "__main__":
