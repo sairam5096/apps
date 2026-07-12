@@ -10,16 +10,46 @@ elseif(DEFINED SYSROOT AND NOT "${SYSROOT}" STREQUAL "")
   set(_SYSROOT "${SYSROOT}")
 endif()
 
-if(DEFINED ENV{CC} AND NOT "$ENV{CC}" STREQUAL "")
+if(DEFINED CMAKE_C_COMPILER AND NOT "${CMAKE_C_COMPILER}" STREQUAL "")
+  # Preserve an explicit -DCMAKE_C_COMPILER selection.
+elseif(DEFINED ENV{CC} AND NOT "$ENV{CC}" STREQUAL "")
   set(CMAKE_C_COMPILER "$ENV{CC}" CACHE FILEPATH "C compiler")
 elseif(DEFINED ENV{CROSS_COMPILE} AND NOT "$ENV{CROSS_COMPILE}" STREQUAL "")
   set(CMAKE_C_COMPILER "$ENV{CROSS_COMPILE}gcc" CACHE FILEPATH "C compiler")
+else()
+  find_program(
+    _AARCH64_MODALIX_C_COMPILER
+    NAMES aarch64-linux-gnu-gcc
+    NO_CMAKE_FIND_ROOT_PATH
+  )
+  if(NOT _AARCH64_MODALIX_C_COMPILER)
+    message(FATAL_ERROR
+      "aarch64-modalix toolchain requires a target C compiler. Set CC or CROSS_COMPILE, "
+      "or install aarch64-linux-gnu-gcc."
+    )
+  endif()
+  set(CMAKE_C_COMPILER "${_AARCH64_MODALIX_C_COMPILER}" CACHE FILEPATH "C compiler")
 endif()
 
-if(DEFINED ENV{CXX} AND NOT "$ENV{CXX}" STREQUAL "")
+if(DEFINED CMAKE_CXX_COMPILER AND NOT "${CMAKE_CXX_COMPILER}" STREQUAL "")
+  # Preserve an explicit -DCMAKE_CXX_COMPILER selection.
+elseif(DEFINED ENV{CXX} AND NOT "$ENV{CXX}" STREQUAL "")
   set(CMAKE_CXX_COMPILER "$ENV{CXX}" CACHE FILEPATH "CXX compiler")
 elseif(DEFINED ENV{CROSS_COMPILE} AND NOT "$ENV{CROSS_COMPILE}" STREQUAL "")
   set(CMAKE_CXX_COMPILER "$ENV{CROSS_COMPILE}g++" CACHE FILEPATH "CXX compiler")
+else()
+  find_program(
+    _AARCH64_MODALIX_CXX_COMPILER
+    NAMES aarch64-linux-gnu-g++
+    NO_CMAKE_FIND_ROOT_PATH
+  )
+  if(NOT _AARCH64_MODALIX_CXX_COMPILER)
+    message(FATAL_ERROR
+      "aarch64-modalix toolchain requires a target C++ compiler. Set CXX or CROSS_COMPILE, "
+      "or install aarch64-linux-gnu-g++."
+    )
+  endif()
+  set(CMAKE_CXX_COMPILER "${_AARCH64_MODALIX_CXX_COMPILER}" CACHE FILEPATH "CXX compiler")
 endif()
 
 if(DEFINED _SYSROOT)
