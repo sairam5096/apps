@@ -1,0 +1,827 @@
+"""Unit tests for the graph-native 16-stream object detection Insight example."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
+from types import SimpleNamespace
+
+import pytest
+
+
+EXAMPLE_DIR = Path(__file__).resolve().parent.parent.parent
+PYTHON_DIR = EXAMPLE_DIR / "src" / "python"
+MAIN_PY = PYTHON_DIR / "main.py"
+STRESS_DIR = EXAMPLE_DIR / "stress"
+MODEL_PATH = "assets/models/yolo26m-det-int8-b1.tar.gz"
+
+if str(PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_DIR))
+
+pytestmark = pytest.mark.unit
+
+
+def load_script_module(name: str):
+    path = STRESS_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _extra_lines(block: str) -> list[str]:
+    lines = []
+    for line in block.strip().splitlines():
+        if not line.strip():
+            continue
+        lines.append(line if line.startswith("  ") else f"  {line}")
+    return lines
+
+
+def write_config(
+    tmp_path: Path,
+    streams: list[str],
+    workers: int = 1,
+    decode_type: str | None = None,
+    input_extra: str = "",
+    inference_extra: str = "",
+    output_extra: str = "",
+) -> Path:
+    stream_lines = "\n".join(f"  - {stream}" for stream in streams)
+    model_lines = ["model:", f"  path: {MODEL_PATH}"]
+    if decode_type is not None:
+        model_lines.append(f"  decode_type: {decode_type}")
+    lines = (
+        model_lines
+        + [
+            "streams:",
+            stream_lines,
+            "input:",
+            "  tcp: true",
+            "  latency_ms: 100",
+        ]
+        + _extra_lines(input_extra)
+        + [
+            "inference:",
+            f"  workers: {workers}",
+        ]
+        + _extra_lines(inference_extra)
+        + [
+            "output:",
+            "  insight:",
+            "    host: 127.0.0.1",
+        ]
+        + _extra_lines(output_extra)
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("\n".join(lines), encoding="utf-8")
+    return config_path
+
+
+class TestMainEntrypoint:
+    def test_help_runs(self):
+        result = subprocess.run(
+            [sys.executable, str(MAIN_PY), "--help"],
+            capture_output=True,
+            text=True,
+            cwd=str(EXAMPLE_DIR),
+            timeout=20,
+        )
+
+        assert result.returncode == 0
+        assert "--config" in result.stdout
+        assert "--validate-config-only" in result.stdout
+
+    def test_missing_config_file_fails_cleanly(self):
+        result = subprocess.run(
+            [sys.executable, str(MAIN_PY), "--config", "does-not-exist.yaml"],
+            capture_output=True,
+            text=True,
+            cwd=str(EXAMPLE_DIR),
+            timeout=20,
+        )
+
+        assert result.returncode == 2
+        assert "config file not found" in result.stderr
+
+
+class TestConfigLoading:
+    def test_load_app_config_accepts_twenty_four_streams(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            [f"rtsp://127.0.0.1:8554/src{index}" for index in range(1, 25)],
+            workers=1,
+            input_extra=textwrap.dedent(
+                """
+                  skip_rtsp_probe: true
+                  width: 1280
+                  height: 720
+                  fps: 20
+                """
+            ).strip(),
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert cfg.model_path == str(tmp_path / MODEL_PATH)
+        assert cfg.decode_type == "yolo26"
+        assert len(cfg.rtsp_urls) == 24
+        assert cfg.workers == 1
+        assert cfg.queue_depth == 1
+        assert cfg.max_inflight_per_stream == 1
+        assert cfg.skip_rtsp_probe is True
+        assert cfg.input_width == 1280
+        assert cfg.input_height == 720
+        assert cfg.input_fps == 20
+        assert cfg.insight_host == "127.0.0.1"
+        assert cfg.warmup_frames == 30
+
+    def test_load_app_config_accepts_insight_visible_limit(self, tmp_path: Path):
+        from main import (
+            effective_insight_visible_streams,
+            is_insight_visible_stream,
+            load_app_config,
+            should_send_metadata,
+        )
+
+        stream_lines = "\n".join(
+            f"  - rtsp://127.0.0.1:8554/src{index}" for index in range(1, 25)
+        )
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"""model:
+  path: {MODEL_PATH}
+streams:
+{stream_lines}
+input:
+  tcp: true
+  latency_ms: 100
+  skip_rtsp_probe: true
+  width: 1280
+  height: 720
+  fps: 20
+inference:
+  workers: 1
+output:
+  insight:
+    host: 127.0.0.1
+    max_visible_streams: 16
+""",
+            encoding="utf-8",
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert cfg.insight_visible_streams == 16
+        assert effective_insight_visible_streams(cfg) == 16
+        assert is_insight_visible_stream(cfg, 15) is True
+        assert is_insight_visible_stream(cfg, 16) is False
+        assert should_send_metadata(cfg, 15) is True
+        assert should_send_metadata(cfg, 16) is False
+
+    def test_load_app_config_resolves_model_and_labels_from_config_directory(
+        self, tmp_path: Path
+    ):
+        from main import load_app_config
+
+        config_dir = tmp_path / "portable-bundle"
+        config_dir.mkdir()
+        config_path = config_dir / "app.yaml"
+        config_path.write_text(
+            """model:
+  path: models/detector.mpk
+  labels: labels/coco.txt
+streams:
+  - rtsp://127.0.0.1:8554/src1
+output:
+  insight:
+    host: 127.0.0.1
+""",
+            encoding="utf-8",
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert cfg.model_path == str(config_dir / "models" / "detector.mpk")
+        assert cfg.labels_path == config_dir / "labels" / "coco.txt"
+
+    def test_load_app_config_accepts_forty_streams(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            [f"rtsp://127.0.0.1:8554/src{index}" for index in range(1, 41)],
+            workers=1,
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert len(cfg.rtsp_urls) == 40
+
+    def test_load_app_config_rejects_removed_output_paths(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            output_extra=textwrap.dedent(
+                """
+                  hidden_streams:
+                    video_sink: dummy
+                """
+            ).strip(),
+        )
+
+        with pytest.raises(ValueError, match="output.hidden_streams was removed"):
+            load_app_config(config_path)
+
+    def test_load_app_config_accepts_yolov8_decode_type(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            workers=1,
+            decode_type="yolov8",
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert cfg.decode_type == "yolov8"
+
+    def test_load_app_config_accepts_decoder_tuning_and_aliases(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            workers=1,
+            input_extra=textwrap.dedent(
+                """
+                  decoder_buffers: 7
+                  decoder_input_buffers: 2
+                  decoder_tuning: throughput_low_latency
+                  skip_rtsp_probe: true
+                  width: 3840
+                  height: 2160
+                  fps: 30
+                """
+            ).strip(),
+        )
+
+        cfg = load_app_config(config_path)
+
+        assert cfg.decoder_buffers == 7
+        assert cfg.decoder_input_buffers == 2
+        assert cfg.decoder_tuning == "throughput-low-latency"
+
+    def test_load_app_config_rejects_too_many_streams(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            [f"rtsp://127.0.0.1:8554/src{index}" for index in range(1, 82)],
+            workers=1,
+        )
+
+        with pytest.raises(ValueError, match="up to 80 streams"):
+            load_app_config(config_path)
+
+    def test_load_app_config_rejects_insight_visible_limit_above_stream_count(
+        self, tmp_path: Path
+    ):
+        from main import load_app_config
+
+        stream_lines = "\n".join(
+            f"  - rtsp://127.0.0.1:8554/src{index}" for index in range(1, 5)
+        )
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"""model:
+  path: {MODEL_PATH}
+streams:
+{stream_lines}
+input:
+  tcp: true
+  latency_ms: 100
+inference:
+  workers: 1
+output:
+  insight:
+    host: 127.0.0.1
+    max_visible_streams: 16
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="cannot exceed stream count"):
+            load_app_config(config_path)
+
+    def test_load_app_config_rejects_empty_streams(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                f"""
+                model:
+                  path: {MODEL_PATH}
+                streams: []
+                output:
+                  insight:
+                    host: 127.0.0.1
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="streams must be a non-empty list"):
+            load_app_config(config_path)
+
+    def test_load_app_config_rejects_non_shared_worker_count(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1", "rtsp://127.0.0.1:8554/src2"],
+            workers=2,
+        )
+
+        with pytest.raises(ValueError, match="set inference.workers to 1"):
+            load_app_config(config_path)
+
+    def test_load_app_config_validates_max_inflight_per_stream(self, tmp_path: Path):
+        from main import load_app_config
+
+        tuned_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            inference_extra="  max_inflight_per_stream: 4",
+        )
+        assert load_app_config(tuned_path).max_inflight_per_stream == 4
+
+        invalid_dir = tmp_path / "invalid"
+        invalid_dir.mkdir()
+        invalid_path = write_config(
+            invalid_dir,
+            ["rtsp://127.0.0.1:8554/src1"],
+            inference_extra="  max_inflight_per_stream: 0",
+        )
+        with pytest.raises(ValueError, match="max_inflight_per_stream must be > 0"):
+            load_app_config(invalid_path)
+
+    def test_load_app_config_rejects_skip_probe_without_caps(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            workers=1,
+            input_extra="  skip_rtsp_probe: true",
+        )
+
+        with pytest.raises(ValueError, match="skip_rtsp_probe requires"):
+            load_app_config(config_path)
+
+    def test_load_app_config_rejects_fps_scheduler_knobs(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            workers=1,
+            inference_extra="  target_fps: 15",
+        )
+
+        with pytest.raises(ValueError, match="target_fps is not supported"):
+            load_app_config(config_path)
+
+    def test_validate_config_only_reports_graph_native_settings(self, tmp_path: Path):
+        config_path = write_config(
+            tmp_path,
+            [
+                "rtsp://127.0.0.1:8554/src1",
+                "rtsp://127.0.0.1:8554/src2",
+            ],
+            workers=1,
+            inference_extra="  queue_depth: 4",
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(MAIN_PY), "--config", str(config_path), "--validate-config-only"],
+            capture_output=True,
+            text=True,
+            cwd=str(EXAMPLE_DIR),
+            timeout=20,
+        )
+
+        assert result.returncode == 0
+        assert "streams=2" in result.stdout
+        assert "workers=1" in result.stdout
+        assert "queue_depth=4" in result.stdout
+        assert "max_inflight_per_stream=1" in result.stdout
+        assert "insight_visible_streams=2" in result.stdout
+        assert "decoder_admission=core" in result.stdout
+
+
+class TestRuntimeOptions:
+    def test_source_options_keep_decoded_handoff_device_visible(self, monkeypatch):
+        import main
+
+        class FakeRtspDecodedInputOptions:
+            def __init__(self):
+                self.output_caps = SimpleNamespace()
+                self.h264_parse_config_interval = -1
+                self.h264_fps = -1
+                self.h264_width = -1
+                self.h264_height = -1
+                self.buffer_mode = ""
+                self.sync_mode = False
+                self.sima_allocator_type = 2
+
+        fake_pyneat = SimpleNamespace(
+            RtspDecodedInputOptions=FakeRtspDecodedInputOptions,
+            Format=SimpleNamespace(NV12="NV12"),
+            CapsMemory=SimpleNamespace(Any="Any"),
+        )
+        monkeypatch.setattr(main, "pyneat", fake_pyneat)
+
+        cfg = main.AppConfig(
+            model_path=MODEL_PATH,
+            labels_path=Path("labels.txt"),
+            rtsp_urls=["rtsp://127.0.0.1:8554/src1"],
+        )
+
+        opt, fps, width, height = main.make_source_options(
+            cfg, cfg.rtsp_urls[0], fps=30, width=640, height=480
+        )
+
+        assert opt.out_format == "NV12"
+        assert opt.decoder_raw_output is True
+        assert opt.decoder_next_element == "CVU"
+        assert opt.auto_caps_from_stream is True
+        assert opt.num_buffers == main.DEFAULT_DECODER_BUFFERS
+        assert not hasattr(opt, "decoder_input_buffers")
+        assert not hasattr(opt, "decoder_memory_opt")
+        assert not hasattr(opt, "decoder_tuning")
+        assert opt.output_caps.enable is True
+        assert opt.output_caps.format == "NV12"
+        assert opt.output_caps.width == 640
+        assert opt.output_caps.height == 480
+        assert opt.output_caps.fps == 30
+        assert opt.output_caps.memory == "Any"
+        assert (fps, width, height) == (30, 640, 480)
+
+    def test_source_options_explicit_caps_override_probe_caps(self, monkeypatch):
+        import main
+
+        class FakeRtspDecodedInputOptions:
+            def __init__(self):
+                self.output_caps = SimpleNamespace()
+                self.h264_parse_config_interval = -1
+                self.h264_fps = -1
+                self.h264_width = -1
+                self.h264_height = -1
+                self.buffer_mode = ""
+                self.sync_mode = False
+                self.sima_allocator_type = 2
+
+        fake_pyneat = SimpleNamespace(
+            RtspDecodedInputOptions=FakeRtspDecodedInputOptions,
+            Format=SimpleNamespace(NV12="NV12"),
+            CapsMemory=SimpleNamespace(Any="Any"),
+        )
+        monkeypatch.setattr(main, "pyneat", fake_pyneat)
+
+        cfg = main.AppConfig(
+            model_path=MODEL_PATH,
+            labels_path=Path("labels.txt"),
+            rtsp_urls=["rtsp://127.0.0.1:8554/src1"],
+            input_width=1280,
+            input_height=720,
+            input_fps=20,
+            decoder_tuning="throughput-low-latency",
+        )
+
+        opt, fps, width, height = main.make_source_options(
+            cfg, cfg.rtsp_urls[0], fps=30, width=640, height=480
+        )
+
+        assert not hasattr(opt, "decoder_memory_opt")
+        assert not hasattr(opt, "decoder_tuning")
+        assert opt.output_caps.width == 1280
+        assert opt.output_caps.height == 720
+        assert opt.output_caps.fps == 20
+        assert (fps, width, height) == (20, 1280, 720)
+
+    def test_realtime_options_matches_cpp_runtime_defaults(self, monkeypatch):
+        import main
+
+        class FakeRunOptions:
+            pass
+
+        fake_pyneat = SimpleNamespace(
+            RunOptions=FakeRunOptions,
+            RunPreset=SimpleNamespace(Realtime="Realtime"),
+            OverflowPolicy=SimpleNamespace(KeepLatest="KeepLatest"),
+            OutputMemory=SimpleNamespace(ZeroCopy="ZeroCopy"),
+        )
+        monkeypatch.setattr(main, "pyneat", fake_pyneat)
+
+        options = main.realtime_options(7)
+
+        assert options.preset == "Realtime"
+        assert options.queue_depth == 7
+        assert options.overflow_policy == "KeepLatest"
+        assert options.output_memory == "ZeroCopy"
+
+    def test_encoded_input_uses_the_same_16_mib_au_limit_as_cpp(self, monkeypatch):
+        import main
+
+        class FakeInputOptions:
+            def __init__(self):
+                self.memory_policy = None
+
+        fake_pyneat = SimpleNamespace(
+            InputOptions=FakeInputOptions,
+            PayloadType=SimpleNamespace(Encoded="Encoded"),
+            Format=SimpleNamespace(H264="H264"),
+            InputMemoryPolicy=SimpleNamespace(SystemMemory="SystemMemory"),
+        )
+        monkeypatch.setattr(main, "pyneat", fake_pyneat)
+
+        options = main.make_encoded_h264_input_options(False)
+
+        assert options.max_bytes == main.MAX_ENCODED_AU_BYTES == 16 * 1024 * 1024
+        assert options.memory_policy == "SystemMemory"
+
+    def test_graph_realtime_link_stamps_stream_id(self, monkeypatch):
+        import main
+
+        class FakeGraphLinkOptions:
+            pass
+
+        fake_pyneat = SimpleNamespace(
+            GraphLinkOptions=FakeGraphLinkOptions,
+            GraphLinkPolicy=SimpleNamespace(RealtimeLatestByStream="latest-by-stream"),
+        )
+        monkeypatch.setattr(main, "pyneat", fake_pyneat)
+
+        link = main.graph_realtime_link(3, "stream7")
+
+        assert link.policy == "latest-by-stream"
+        assert link.queue_depth == 3
+        assert link.stream_id == "stream7"
+        assert link.max_inflight_per_stream == 1
+
+        tuned = main.graph_realtime_link(3, "stream7", 4)
+        assert tuned.max_inflight_per_stream == 4
+
+    def test_stream_index_from_detection_validates_route_metadata(self):
+        import main
+
+        assert main.stream_index_from_detection(SimpleNamespace(stream_id="stream2"), 4) == 2
+        assert main.stream_index_from_detection(SimpleNamespace(stream_id=""), 1) == 0
+        with pytest.raises(RuntimeError, match="missing stream id"):
+            main.stream_index_from_detection(SimpleNamespace(stream_id=""), 2)
+        with pytest.raises(RuntimeError, match="invalid detection stream id"):
+            main.stream_index_from_detection(SimpleNamespace(stream_id="streamx"), 4)
+        with pytest.raises(RuntimeError, match="out of range"):
+            main.stream_index_from_detection(SimpleNamespace(stream_id="stream4"), 4)
+
+
+class TestHandoffGates:
+    def test_stability_gate_accounts_for_target_rates(self):
+        gate = load_script_module("app16_insight_stability_gate")
+
+        def ingest(packets: int, metadata: int):
+            return {
+                "active": True,
+                "rtp": {"packets_received": packets},
+                "metadata": {"active": True, "messages_received": metadata},
+            }
+
+        def peer(frames: int, metadata: int):
+            return {
+                "id": 7,
+                "browser": {
+                    "video": {"active": True},
+                    "inbound_rtp": {"frames_decoded": frames},
+                },
+                "metadata": {"messages_sent": metadata},
+            }
+
+        record = gate.sample(
+            [0],
+            {0: ingest(100, 100)},
+            {0: ingest(200, 200)},
+            {0: peer(100, 100)},
+            {0: peer(200, 200)},
+            5.0,
+            18.0,
+            18.0,
+        )
+
+        assert record["passed"] is True
+        assert record["channels"][0]["browser_video_fps"] == 20.0
+        distribution = gate.rate_summary([18.0, 19.0, 20.0, 20.0, 21.0], 18.0)
+        assert distribution["median"] == 20.0
+        assert distribution["rate_misses"] == 0
+
+    def test_visual_gate_loads_exact_channel_identity_manifest(self, tmp_path: Path):
+        gate = load_script_module("app16_insight_visual_gate")
+        manifest_path = tmp_path / "identity.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "width": 1280,
+                    "height": 720,
+                    "marker": {"x": 8, "y": 8, "width": 24, "height": 24},
+                    "temporal": {
+                        "x": 8,
+                        "y": 70,
+                        "bit_width": 8,
+                        "bit_height": 20,
+                        "bit_stride": 12,
+                        "bits": 12,
+                        "period_frames": 2400,
+                        "fps": 20,
+                        "luma_threshold": 128,
+                        "sync_tolerance_frames": 6,
+                    },
+                    "channels": {
+                        "0": {"rgb": [230, 34, 34]},
+                        "1": {"rgb": [34, 230, 230]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        identity = gate.load_identity_manifest(manifest_path, [0, 1], 1280, 720)
+
+        assert identity["colors"][0] == [230.0, 34.0, 34.0]
+        assert identity["temporal"]["period_frames"] == 2400
+        assert gate.rgb_distance([230.0, 35.0, 35.0], identity["colors"][0]) < 2.0
+        with pytest.raises(ValueError, match="no valid RGB marker for channel 2"):
+            gate.load_identity_manifest(manifest_path, [0, 2], 1280, 720)
+
+    def test_visual_gate_rejects_backward_or_stale_temporal_metadata(self):
+        gate = load_script_module("app16_insight_visual_gate")
+        temporal = {
+            "period_frames": 2400,
+            "fps": 20.0,
+            "sync_tolerance_frames": 6.0,
+        }
+
+        def metadata(frame: int, count: int):
+            pts_ns = frame * 1_000_000_000 // 20
+            return {
+                "count": count,
+                "ptsNs": pts_ns,
+                "rtpTimestamp": (pts_ns * 90000 // 1_000_000_000) & 0xFFFFFFFF,
+            }
+
+        forward = [
+            {"temporalCode": 0, "metadata": metadata(5, 10)},
+            {"temporalCode": 20, "metadata": metadata(25, 30)},
+            {"temporalCode": 40, "metadata": metadata(45, 50)},
+        ]
+        assert gate.analyze_temporal_samples(forward, [0.0, 1.0, 2.0], temporal)[
+            "passed"
+        ]
+
+        backward = [forward[0], forward[1], {"temporalCode": 10, "metadata": metadata(15, 40)}]
+        assert not gate.analyze_temporal_samples(backward, [0.0, 1.0, 2.0], temporal)[
+            "passed"
+        ]
+
+        stale = [forward[0], forward[1], {"temporalCode": 40, "metadata": metadata(25, 30)}]
+        assert not gate.analyze_temporal_samples(stale, [0.0, 1.0, 2.0], temporal)["passed"]
+
+        stable_but_far_behind = [
+            {"temporalCode": 0, "metadata": metadata(100, 10)},
+            {"temporalCode": 20, "metadata": metadata(120, 30)},
+            {"temporalCode": 40, "metadata": metadata(140, 50)},
+        ]
+        far_result = gate.analyze_temporal_samples(
+            stable_but_far_behind, [0.0, 1.0, 2.0], temporal
+        )
+        assert far_result["pts_video_offset_stable"]
+        assert not far_result["pts_video_offset_synced"]
+        assert not far_result["passed"]
+
+    def test_visual_gate_hooks_local_and_remote_data_channels(self):
+        gate = load_script_module("app16_insight_visual_gate")
+        assert "createDataChannel" in gate.CANVAS_HOOK_JS
+        assert "addEventListener('datachannel'" in gate.CANVAS_HOOK_JS
+        assert "setRemoteDescription" in gate.CANVAS_HOOK_JS
+
+    def test_identity_fixture_plan_is_unique_and_forces_no_b_frames(self):
+        fixture = load_script_module("app16_make_identity_fixtures")
+        colors = fixture.channel_colors(list(range(24)))
+        args = SimpleNamespace(
+            ffmpeg="ffmpeg",
+            overwrite=True,
+            input=Path("moving.mp4"),
+            duration_seconds=120.0,
+            fps=20,
+            width=1280,
+            height=720,
+            font_file=Path("font.ttf"),
+        )
+        command = fixture.ffmpeg_command(
+            args, 7, colors[7], Path("channel-07-1280x720p20-no-b.mp4")
+        )
+
+        assert len({tuple(rgb) for rgb in colors.values()}) == 24
+        assert command[command.index("-bf") + 1] == "0"
+        assert "bframes=0" in command[command.index("-x264-params") + 1]
+        assert "text=CH07" in command[command.index("-vf") + 1]
+        assert "floor(t*20)" in command[command.index("-vf") + 1]
+        assert "enable=" in command[command.index("-vf") + 1]
+
+
+class FakeMetadataSender:
+    def __init__(self):
+        self.calls = []
+
+    def send_metadata(self, metadata_type, data_json, timestamp_ms, frame_id):
+        self.calls.append((metadata_type, data_json, timestamp_ms, frame_id))
+        return True
+
+
+class FakeSample:
+    frame_id = 42
+    pts_ns = 1_234_000_000
+
+
+class TestMetadata:
+    def test_send_metadata_noops_when_stream_metadata_disabled(self):
+        from main import SourceRuntime, StreamProfile, send_metadata
+
+        runtime = SourceRuntime(
+            index=16,
+            url="rtsp://127.0.0.1:8554/src17",
+            metadata_sender=None,
+            labels=["person"],
+            source_options=None,
+            profile=StreamProfile(False, 16),
+            frame_w=100,
+            frame_h=100,
+            source_fps=30,
+        )
+
+        send_metadata(runtime, FakeSample(), [])
+
+    def test_send_metadata_uses_object_detection_contract(self):
+        from main import SourceRuntime, StreamProfile, send_metadata
+
+        sender = FakeMetadataSender()
+        runtime = SourceRuntime(
+            index=0,
+            url="rtsp://127.0.0.1:8554/src1",
+            metadata_sender=sender,
+            labels=["person"],
+            source_options=None,
+            profile=StreamProfile(False, 0),
+            frame_w=100,
+            frame_h=100,
+            source_fps=30,
+            video_port=9000,
+        )
+        boxes = [
+            {
+                "x1": 10.0,
+                "y1": 20.0,
+                "x2": 40.0,
+                "y2": 60.0,
+                "score": 0.75,
+                "class_id": 0,
+            }
+        ]
+
+        send_metadata(runtime, FakeSample(), boxes)
+
+        assert len(sender.calls) == 1
+        metadata_type, data_json, timestamp_ms, frame_id = sender.calls[0]
+        assert metadata_type == "object-detection"
+        assert timestamp_ms == 1234
+        assert frame_id == "42"
+        assert json.loads(data_json) == {
+            "objects": [
+                {
+                    "id": "obj_1",
+                    "label": "person",
+                    "confidence": 0.75,
+                    "bbox": [10.0, 20.0, 30.0, 40.0],
+                }
+            ]
+        }
