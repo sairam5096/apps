@@ -507,8 +507,12 @@ void validate_config(const AppConfig& cfg) {
   sima_examples::require(cfg.initial_detection_timeout_ms > 0,
                          "runtime.initial_detection_timeout_ms must be > 0");
   sima_examples::require(cfg.video_port_base > 0, "output.insight.video_port_base must be > 0");
+  sima_examples::require(cfg.video_port_base <= 65535,
+                         "output.insight.video_port_base must be <= 65535");
   sima_examples::require(cfg.metadata_port_base > 0,
                          "output.insight.metadata_port_base must be > 0");
+  sima_examples::require(cfg.metadata_port_base <= 65535,
+                         "output.insight.metadata_port_base must be <= 65535");
   sima_examples::require(cfg.insight_video_sync_delay_ms >= 0 &&
                              cfg.insight_video_sync_delay_ms <= 2000,
                          "output.insight.sync_delay_ms must be between 0 and 2000");
@@ -518,6 +522,21 @@ void validate_config(const AppConfig& cfg) {
     sima_examples::require(static_cast<std::size_t>(cfg.insight_visible_streams) <=
                                cfg.rtsp_urls.size(),
                            "output.insight.max_visible_streams cannot exceed stream count");
+  }
+  const auto visible_streams = static_cast<std::int64_t>(
+      cfg.insight_visible_streams < 0 ? cfg.rtsp_urls.size()
+                                      : static_cast<std::size_t>(cfg.insight_visible_streams));
+  if (visible_streams > 0) {
+    const auto video_last = static_cast<std::int64_t>(cfg.video_port_base) + visible_streams - 1;
+    const auto metadata_last =
+        static_cast<std::int64_t>(cfg.metadata_port_base) + visible_streams - 1;
+    sima_examples::require(video_last <= 65535,
+                           "output.insight video port range exceeds 65535");
+    sima_examples::require(metadata_last <= 65535,
+                           "output.insight metadata port range exceeds 65535");
+    const bool disjoint = video_last < cfg.metadata_port_base ||
+                          metadata_last < cfg.video_port_base;
+    sima_examples::require(disjoint, "output.insight video and metadata port ranges overlap");
   }
 }
 
@@ -1722,13 +1741,19 @@ int main(int argc, char** argv) {
 
     const AppConfig cfg = load_app_config(cli.config_path);
     if (cli.validate_config_only) {
+      const int visible_streams = effective_insight_visible_streams(cfg);
+      const int video_port_last = cfg.video_port_base + std::max(0, visible_streams - 1);
+      const int metadata_port_last = cfg.metadata_port_base + std::max(0, visible_streams - 1);
       std::cout << "Config validated: " << cli.config_path << " (streams=" << cfg.rtsp_urls.size()
                 << ", model_path=" << cfg.model_path
                 << ", labels_path=" << cfg.labels_path.string()
                 << ", workers=" << cfg.workers << ", queue_depth=" << cfg.queue_depth
                 << ", internal_queue_depth=" << cfg.internal_queue_depth
                 << ", max_inflight_per_stream=" << cfg.max_inflight_per_stream
-                << ", insight_visible_streams=" << effective_insight_visible_streams(cfg)
+                << ", input=" << cfg.input_width << "x" << cfg.input_height << "@"
+                << cfg.input_fps << ", insight_visible_streams=" << visible_streams
+                << ", video_ports=" << cfg.video_port_base << "-" << video_port_last
+                << ", metadata_ports=" << cfg.metadata_port_base << "-" << metadata_port_last
                 << ", sync_delay_ms=" << cfg.insight_video_sync_delay_ms
                 << ", bypass_model=" << (cfg.bypass_model ? "true" : "false")
                 << ", bypass_preprocess=" << (cfg.bypass_preprocess ? "true" : "false")

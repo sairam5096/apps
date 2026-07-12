@@ -347,12 +347,33 @@ def validate_config(cfg: AppConfig) -> None:
         raise ValueError("runtime.initial_detection_timeout_ms must be > 0")
     if cfg.video_port_base <= 0:
         raise ValueError("output.insight.video_port_base must be > 0")
+    if cfg.video_port_base > 65535:
+        raise ValueError("output.insight.video_port_base must be <= 65535")
     if cfg.metadata_port_base <= 0:
         raise ValueError("output.insight.metadata_port_base must be > 0")
+    if cfg.metadata_port_base > 65535:
+        raise ValueError("output.insight.metadata_port_base must be <= 65535")
     if cfg.insight_visible_streams < ALL_INSIGHT_STREAMS:
         raise ValueError("output.insight.max_visible_streams must be >= -1 (-1 means all)")
     if cfg.insight_visible_streams >= 0 and cfg.insight_visible_streams > len(cfg.rtsp_urls):
         raise ValueError("output.insight.max_visible_streams cannot exceed stream count")
+    visible_streams = (
+        len(cfg.rtsp_urls)
+        if cfg.insight_visible_streams < 0
+        else cfg.insight_visible_streams
+    )
+    if visible_streams > 0:
+        video_last = cfg.video_port_base + visible_streams - 1
+        metadata_last = cfg.metadata_port_base + visible_streams - 1
+        if video_last > 65535:
+            raise ValueError("output.insight video port range exceeds 65535")
+        if metadata_last > 65535:
+            raise ValueError("output.insight metadata port range exceeds 65535")
+        if not (
+            video_last < cfg.metadata_port_base
+            or metadata_last < cfg.video_port_base
+        ):
+            raise ValueError("output.insight video and metadata port ranges overlap")
 
 
 def resolve_config_relative_path(config_path: Path, value: str) -> Path:

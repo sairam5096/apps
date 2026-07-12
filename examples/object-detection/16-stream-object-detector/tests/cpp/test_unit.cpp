@@ -143,6 +143,28 @@ bool test_validate_config_only_accepts_insight_visible_limit(const std::string& 
   return ok;
 }
 
+bool test_validate_config_only_rejects_overlapping_insight_ports(const std::string& binary) {
+  const fs::path config_path = write_config(
+      "test_validate_config_only_rejects_overlapping_insight_ports",
+      model_header() + "streams:\n" + stream_entries(4) +
+          "inference:\n"
+          "  workers: 1\n"
+          "output:\n"
+          "  insight:\n"
+          "    host: 127.0.0.1\n"
+          "    video_port_base: 9000\n"
+          "    metadata_port_base: 9002\n"
+          "    max_visible_streams: 4\n");
+  const auto result =
+      spawn_and_wait(binary, {"--config", config_path.string(), "--validate-config-only"}, 20000);
+  const bool ok =
+      expect_true(result.exit_code == 1, "overlapping Insight port ranges are rejected") &&
+      expect_contains(result.stderr_text, "port ranges overlap",
+                      "overlap error identifies Insight port ranges");
+  remove_dir(config_path.parent_path().string());
+  return ok;
+}
+
 bool test_validate_config_only_accepts_forty_streams(const std::string& binary) {
   const fs::path config_path =
       write_config("test_validate_config_only_accepts_forty_streams", valid_config(40, 1));
@@ -736,6 +758,7 @@ int main(int argc, char** argv) {
   ok &= test_missing_config_file_fails_cleanly(binary);
   ok &= test_validate_config_only_accepts_twenty_four_streams(binary);
   ok &= test_validate_config_only_accepts_insight_visible_limit(binary);
+  ok &= test_validate_config_only_rejects_overlapping_insight_ports(binary);
   ok &= test_validate_config_only_accepts_forty_streams(binary);
   ok &= test_validate_config_only_rejects_removed_output_paths(binary);
   ok &= test_validate_config_only_accepts_yolov8_decode_type(binary);

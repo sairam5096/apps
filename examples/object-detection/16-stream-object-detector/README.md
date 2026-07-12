@@ -8,12 +8,13 @@
 | Tags | object-detection, RTSP, multistream, Insight, YOLO26 |
 | Language | C++ (validated), Python (reference only) |
 | Binary | `16-stream-object-detector` |
-| Validated profile | 24 × 1280×720 at 20 FPS |
+| Checked-in profiles | 16 × 720p25, 24 × 720p20, 48 × 720p10 |
 
 ## What the validated C++ application does
 
-Despite its historical name, this example's checked-in profile processes 24 RTSP/H.264
-cameras. Each source is depacketized once and then follows two paths:
+Despite its historical name, this example uses one shared implementation with selectable 16-,
+24-, and 48-stream RTSP/H.264 profiles. Each source is depacketized once and then follows two
+paths:
 
 ```text
 RTSP/H.264 -> AU-aligned H.264
@@ -65,6 +66,27 @@ original encoded AU instead of advancing an epoch from metadata completion order
 or expired identity after a reconnect is rejected and counted as
 `metadata_pts_epoch_unresolved`; guessing could draw a valid box on the wrong loop.
 
+## Select a checked-in profile
+
+The profile name includes its stream count, resolution, and source FPS. Edit only the RTSP URLs
+and Insight host when moving to another lab; do not silently change its buffer geometry.
+
+| Config | Sources | Decoder out/in | Detector q/i/m | Insight ports | Basis |
+| --- | ---: | ---: | ---: | --- | --- |
+| `config-16x720p25.yaml` | 16 × 1280×720 @ 25 FPS | 8 / 2 | 16 / 1 / 1 | video 9000–9015; metadata 9100–9115 | Original 16-stream profile recovered from Apps `9ab92cd` |
+| `config-24x720p20.yaml` | 24 × 1280×720 @ 20 FPS | 16 / 2 | 4 / 1 / 4 | video 9000–9023; metadata 9100–9123 | Proven 24×20 profile, 19.91 detections/s/stream median |
+| `config-48x720p10.yaml` | 48 × 1280×720 @ 10 FPS | 4 / 2 | 1 / 2 / 1 | video 9000–9047; metadata 9100–9147 | Validated B4 48×10 profile |
+
+Here `q/i/m` means `queue_depth`, `internal_queue_depth`, and
+`max_inflight_per_stream`. `src/common/config.yaml` remains a compatibility alias containing the
+same values as the named 24×20 profile. The historical 16-stream config predates the internal
+queue and public credit settings; the current profile makes their bounded values `1` explicit
+while preserving its original 25 FPS, 8/2 decoder pools, and detector queue depth 16.
+
+All three configs use `yolo26n_raw_supported_einsum_mpk.tar.gz` and `coco_label.txt` relative to
+their own directory. This avoids build-host absolute paths. Put the model archive beside the
+configs, or change the relative model path consistently in the selected file.
+
 ## Prerequisites
 
 - Apps, Core, and Internals built and installed from the matching handoff revisions.
@@ -93,18 +115,20 @@ the final Apps documentation commit as well as this implementation revision.
 
 ## Build and run
 
-From the Apps repository root:
+From the Apps repository root, choose exactly one named config:
 
 ```bash
 ./build.sh
 
-./build/examples/object-detection/16-stream-object-detector/16-stream-object-detector \
-  --config examples/object-detection/16-stream-object-detector/src/common/config.yaml \
-  --validate-config-only
+APP=./build/examples/object-detection/16-stream-object-detector/16-stream-object-detector
+PROFILE=examples/object-detection/16-stream-object-detector/src/common/config-24x720p20.yaml
 
-./build/examples/object-detection/16-stream-object-detector/16-stream-object-detector \
-  --config examples/object-detection/16-stream-object-detector/src/common/config.yaml
+"$APP" --config "$PROFILE" --validate-config-only
+"$APP" --config "$PROFILE"
 ```
+
+Set `PROFILE` instead to `config-16x720p25.yaml` or `config-48x720p10.yaml` to select those
+options. The application code and binary do not change.
 
 The config check should report:
 
@@ -367,6 +391,8 @@ Do not use the Python path for the 24×20 handoff or Insight acceptance result.
 - Validated C++ app: `src/cpp/main.cpp`
 - CPU delivery queue: `src/cpp/encoded_delivery_queue.h`
 - Default profile/assets: `src/common/`
+- Named profiles: `src/common/config-16x720p25.yaml`,
+  `src/common/config-24x720p20.yaml`, `src/common/config-48x720p10.yaml`
 - C++ unit tests: `tests/cpp/test_unit.cpp`
 - Python reference/tests: `src/python/main.py`, `tests/python/test_unit.py`
 - Supported live gates: `stress/app16_insight_visual_gate.py`,

@@ -11,6 +11,7 @@ import textwrap
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -18,6 +19,7 @@ PYTHON_DIR = EXAMPLE_DIR / "src" / "python"
 MAIN_PY = PYTHON_DIR / "main.py"
 STRESS_DIR = EXAMPLE_DIR / "stress"
 MODEL_PATH = "assets/models/yolo26m-det-int8-b1.tar.gz"
+COMMON_DIR = EXAMPLE_DIR / "src" / "common"
 
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
@@ -111,6 +113,100 @@ class TestMainEntrypoint:
 
 
 class TestConfigLoading:
+    @pytest.mark.parametrize(
+        (
+            "filename",
+            "streams",
+            "fps",
+            "decoder_buffers",
+            "decoder_input_buffers",
+            "decoder_tuning",
+            "queue_depth",
+            "internal_queue_depth",
+            "max_inflight",
+        ),
+        [
+            ("config-16x720p25.yaml", 16, 25, 8, 2, "auto", 16, 1, 1),
+            ("config-24x720p20.yaml", 24, 20, 16, 2, "auto", 4, 1, 4),
+            (
+                "config-48x720p10.yaml",
+                48,
+                10,
+                4,
+                2,
+                "throughput-low-latency",
+                1,
+                2,
+                1,
+            ),
+        ],
+    )
+    def test_named_profiles_validate_portably(
+        self,
+        filename: str,
+        streams: int,
+        fps: int,
+        decoder_buffers: int,
+        decoder_input_buffers: int,
+        decoder_tuning: str,
+        queue_depth: int,
+        internal_queue_depth: int,
+        max_inflight: int,
+    ):
+        from main import effective_insight_visible_streams, load_app_config
+
+        path = COMMON_DIR / filename
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        cfg = load_app_config(path)
+
+        assert len(cfg.rtsp_urls) == streams
+        assert (cfg.input_width, cfg.input_height, cfg.input_fps) == (1280, 720, fps)
+        assert cfg.decoder_buffers == decoder_buffers
+        assert cfg.decoder_input_buffers == decoder_input_buffers
+        assert cfg.decoder_tuning == decoder_tuning
+        assert cfg.queue_depth == queue_depth
+        assert raw["inference"]["internal_queue_depth"] == internal_queue_depth
+        assert cfg.max_inflight_per_stream == max_inflight
+        assert effective_insight_visible_streams(cfg) == streams
+        assert (cfg.video_port_base, cfg.video_port_base + streams - 1) == (
+            9000,
+            9000 + streams - 1,
+        )
+        assert (cfg.metadata_port_base, cfg.metadata_port_base + streams - 1) == (
+            9100,
+            9100 + streams - 1,
+        )
+        assert cfg.video_port_base + streams - 1 < cfg.metadata_port_base
+        assert not Path(raw["model"]["path"]).is_absolute()
+        assert not Path(raw["model"]["labels"]).is_absolute()
+
+    def test_default_config_is_the_named_24x20_profile(self):
+        default = yaml.safe_load((COMMON_DIR / "config.yaml").read_text(encoding="utf-8"))
+        named = yaml.safe_load(
+            (COMMON_DIR / "config-24x720p20.yaml").read_text(encoding="utf-8")
+        )
+        assert default == named
+
+    def test_config_rejects_overlapping_insight_port_ranges(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            [f"rtsp://127.0.0.1:8554/src{i}" for i in range(4)],
+        )
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace(
+                "    host: 127.0.0.1",
+                "    host: 127.0.0.1\n"
+                "    video_port_base: 9000\n"
+                "    metadata_port_base: 9002\n"
+                "    max_visible_streams: 4",
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="port ranges overlap"):
+            load_app_config(config_path)
+
     def test_load_app_config_accepts_twenty_four_streams(self, tmp_path: Path):
         from main import load_app_config
 
