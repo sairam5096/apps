@@ -20,7 +20,7 @@ paths:
 RTSP/H.264 -> AU-aligned H.264
   detector: SimaDecode -> latest-by-stream C++ mux -> Preproc -> YOLO26n -> Boxdecode
   video:    owned CPU copy of encoded AU -> bounded delay -> VideoSender -> Insight channel N
-  boxes:    detection JSON held by PTS epoch -> released with matching delayed video -> channel N
+  boxes:    detection JSON held by PTS epoch -> newest result not newer than delayed video -> channel N
 ```
 
 The video path does **not** copy decoded frames to CPU and does not allocate a second EV74
@@ -44,17 +44,24 @@ byte capacity  = 16 MiB
 maximum VideoSender input AU = 16 MiB
 ```
 
-At 20 FPS with the checked-in 400 ms delay this is 72 encoded AUs per stream. The frame
-reserve absorbs a legal RTSP catch-up burst; the byte limit is the actual memory bound and
-also guarantees that an AU accepted by the delay queue fits the VideoSender input. `Sample`,
-caps, deque, and metadata bookkeeping add a small amount of ordinary CPU memory. No part of
-this queue consumes EV74 memory.
+With the checked-in 400 ms delay, the encoded capacity is 74 AUs at 25 FPS, 72 at 20 FPS, and
+68 at 10 FPS. The frame reserve absorbs a legal RTSP catch-up burst; the byte limit is the actual
+memory bound and also guarantees that an AU accepted by the delay queue fits the VideoSender
+input. `Sample`, caps, deque, and metadata bookkeeping add a small amount of ordinary CPU memory.
+No part of this queue consumes EV74 memory.
 
-The checked-in decoder configuration is 16 output surfaces and two compressed-input buffers
-per stream. Those are codec pool surfaces, not application staging queues. The proven detector
-settings are link depth 4, one global internal model-stage handoff, and four latest-mux credits per
-stream. In the controlled 24×20 tuning run, the earlier depth/credit-one profile produced a median
-17.0 detections/s per stream; `queue_depth=4`, `internal_queue_depth=1`, and
+The 24×20 profile configures 16 decoder output surfaces and two compressed-input buffers per
+stream. The other profiles' decoder pools are listed below. These are codec pool surfaces, not
+application video staging queues. Core also places one depth-one leaky decoded ingress queue on
+each source immediately before the latest-by-stream mux. The mux itself retains at most one
+replaceable pending decoded frame per stream and admits no more than
+`max_inflight_per_stream` selected frames from that stream into the shared detector.
+
+`internal_queue_depth` is shared consumer-stage buffering, not one queue per camera. A positive
+value inserts a bounded, non-leaky queue of that depth before each CVU, MLA, and box-decode stage
+in the fused detector pipeline. For this model that means three shared stage queues. In the
+controlled 24×20 tuning run, the earlier depth/credit-one profile produced a median 17.0
+detections/s per stream; `queue_depth=4`, `internal_queue_depth=1`, and
 `max_inflight_per_stream=4` produced 19.91 with zero encoded-video queue rejects. These are now
 defaults rather than unpinned tuning candidates.
 
@@ -64,7 +71,10 @@ PTS discontinuity. A bounded CPU-only history retains exact `(PTS, epoch)` ident
 AU leaves the delay queue. Out-of-order inference completions therefore resolve against the
 original encoded AU instead of advancing an epoch from metadata completion order. An ambiguous
 or expired identity after a reconnect is rejected and counted as
-`metadata_pts_epoch_unresolved`; guessing could draw a valid box on the wrong loop.
+`metadata_pts_epoch_unresolved`; guessing could draw a valid box on the wrong loop. When video is
+released, App16 coalesces eligible metadata and sends the newest detection whose PTS is not newer
+than that AU. Normally the 400 ms delay makes this the same source frame; a later inference result
+is intentionally applied to a later video AU in the same epoch rather than sent backward in time.
 
 ## Select a checked-in profile
 
@@ -78,10 +88,15 @@ and Insight host when moving to another lab; do not silently change its buffer g
 | `config-48x720p10.yaml` | 48 × 1280×720 @ 10 FPS | 4 / 2 | 1 / 2 / 1 | video 9000–9047; metadata 9100–9147 | Validated B4 48×10 profile |
 
 Here `q/i/m` means `queue_depth`, `internal_queue_depth`, and
-`max_inflight_per_stream`. `src/common/config.yaml` remains a compatibility alias containing the
-same values as the named 24×20 profile. The historical 16-stream config predates the internal
-queue and public credit settings; the current profile makes their bounded values `1` explicit
-while preserving its original 25 FPS, 8/2 decoder pools, and detector queue depth 16.
+`max_inflight_per_stream`. `q` sizes the terminal every-frame detection output and the Run's
+general output queue; it is also retained on the public source link for non-fused compatibility.
+The fused latest-by-stream mux does not retain `q` decoded frames per camera: it has one
+replaceable pending slot per stream, and `m` is its per-stream selected-frame credit. `i` is the
+depth of each shared consumer-stage queue described above. `src/common/config.yaml` remains a
+compatibility alias containing the same values as the named 24×20 profile. The historical
+16-stream config predates the internal queue and public credit settings; the current profile makes
+their bounded values `1` explicit while preserving its original 25 FPS, 8/2 decoder pools, and
+detection output/Run queue depth 16.
 
 All three configs use `yolo26n_raw_supported_einsum_mpk.tar.gz` and `coco_label.txt` relative to
 their own directory. This avoids build-host absolute paths. Put the model archive beside the
@@ -91,8 +106,9 @@ configs, or change the relative model path consistently in the selected file.
 
 - Apps, Core, and Internals built and installed from the matching handoff revisions.
 - A Modalix DevKit with the decoder service running.
-- Insight reachable from the DevKit and configured for channels 0 through 23.
-- Twenty-four H.264 RTSP sources at the caps declared in the config.
+- Insight reachable from the DevKit and configured for channels `0` through `N-1`, where `N` is
+  16, 24, or 48 for the selected profile.
+- The matching 16, 24, or 48 H.264 RTSP sources at the caps declared in that profile.
 - A YOLO26n model pack.
 
 `model.path` and `model.labels` are resolved relative to the YAML file, not the caller's
@@ -138,8 +154,18 @@ max_inflight_per_stream=4,
 insight_visible_streams=24, sync_delay_ms=400, decoder_admission=core
 ```
 
-No private `SIMA_*` feature switch is used or required. Useful application-owned diagnostics
-are:
+No private `SIMA_*` feature switch is used or required. For a reproducible validated topology,
+make sure these Core diagnostic overrides are **unset**; inheriting any of them can silently alter
+the fused ingress or shared stage queues:
+
+```bash
+unset SIMA_FUSED_REALTIME_CONSUMER_QUEUE_PLACEMENT
+unset SIMA_FUSED_REALTIME_QUEUE_PRE_LEAKY_DOWNSTREAM
+unset SIMA_FUSED_REALTIME_BYPASS_INGRESS_QUEUE
+unset SIMA_FUSED_REALTIME_INGRESS_QUEUE_DEPTH
+```
+
+Useful application-owned diagnostics are:
 
 - `APP16_LIVENESS_MS=5000`: periodic per-stream progress and send-failure counters.
 - `APP16_VERBOSE=1`: verbose application logs; leave unset for FPS acceptance.
@@ -151,9 +177,10 @@ Important YAML settings:
 - `input.skip_rtsp_probe: true` requires correct width, height, and FPS.
 - `input.drop_on_latency: true` prevents a stale RTSP backlog.
 - `inference.workers` must be `1`.
-- `inference.queue_depth: 4` is the proven latest-frame detector-link depth for 24×20.
-- `inference.internal_queue_depth` is a small global model-stage handoff, not a per-camera
-  decoded-frame queue. The proven value is `1`.
+- `inference.queue_depth: 4` is the proven terminal detection output/Run queue depth for 24×20.
+  The fused mux still has only one replaceable pending slot per stream.
+- `inference.internal_queue_depth` is the depth of each bounded shared CVU/MLA/box-decode stage
+  queue, not a per-camera decoded-frame queue. The proven value is `1`.
 - `inference.max_inflight_per_stream: 4` is the proven public latest-mux credit for each camera.
   Together these settings sustained approximately 20 detections/s per channel without encoded
   video rejects. Do not replace them with private environment overrides.
@@ -207,6 +234,12 @@ for i in $(seq 1 24); do
     2>"/tmp/app16-rtsp-pubs/src${i}.err" </dev/null
 done
 ```
+
+App16 builds its RTSP source graph once; it is not a publisher-restart supervisor. If all
+publishers stop, terminal RTSP EOS/error ends the fused source graph, and restarting publishers
+does not rebuild it in place. Start or restart the publishers first, confirm their RTSP paths are
+available, and then restart App16. Do not cite a stop-all/restart-publishers experiment as an
+in-process reconnect test.
 
 The loop above proves per-tile motion and boxes, but every channel intentionally carries the
 same media. It therefore cannot prove that channel 7 was not accidentally wired to channel 3.
@@ -282,8 +315,9 @@ marker, the gate samples it seven times by default and also requires:
 The fixture frame code and pipeline PTS can have an arbitrary channel-specific origin offset when
 the publisher was already running before App16 joined. WebRTC also applies a random per-peer RTP
 timestamp translation, so neither offset is required to be near zero. Focused queue tests prove
-that App16 releases metadata against the exact source PTS. The runtime gate proves that video and
-metadata both advance without relative RTP drift while the temporal code independently proves
+that App16 resolves the metadata epoch from the exact source PTS and never releases metadata newer
+than the video AU. The runtime gate proves that video and metadata both advance without relative
+RTP drift while the temporal code independently proves
 displayed-frame direction and freshness. Receiver synchronization sources describe the latest
 inbound packet rather than necessarily the exact frame presented, so this is an explicit
 no-drift inference with a frame tolerance, not a claim of absolute browser presentation skew.
@@ -345,7 +379,7 @@ viewer only after both commands exit.
 Have exactly one browser peer open for all 24 channels: either the controlled temporal gate above
 or an operator viewer. Run `stress/app16_insight_stability_gate.py` on the Insight host. It issues
 only GET requests to Insight's ingest/egress stats APIs; it never calls `/offer`, creates a WebRTC
-peer, or steals metadata ownership. Every five-second sample requires all channels to advance at
+peer, or steals metadata ownership. Every ten-second sample requires all channels to advance at
 Insight ingest and at the existing browser, including browser-decoded frames and metadata
 messages.
 Those read-only APIs expose counters, not metadata payload PTS or decoded video pixels. This
@@ -363,7 +397,7 @@ owner while retaining deterministic startup behavior.
 python3 stress/app16_insight_stability_gate.py \
   --base-url https://127.0.0.1:9900 \
   --channel-ids 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 \
-  --duration-seconds 1800 --interval-seconds 5 \
+  --duration-seconds 1800 --interval-seconds 10 \
   --expected-video-fps 20 --expected-metadata-fps 20 \
   --minimum-fps-ratio 0.9 --minimum-median-fps-ratio 0.95 --max-bad-samples 0 \
   --output-prefix runs/app16-stability-24x20-30m
@@ -373,7 +407,7 @@ It writes one JSONL record per interval plus a summary JSON. The summary include
 channel's minimum, p05, median, p95, maximum, and rate-miss count for browser video, Insight
 ingest metadata, and browser metadata. A pass requires the full duration, no bad sample, and
 at least 95% of the requested rate at each channel's median. The 90% per-sample floor tolerates
-five-second browser-report quantization; it does not redefine an 18 FPS run as a 20 FPS result.
+ten-second browser-report quantization; it does not redefine an 18 FPS run as a 20 FPS result.
 Use the reported distributions to show that observed rates are actually near 20. Because this
 gate observes the existing viewer, an initial `missing_operator_peers` error means the dedicated
 target/operator viewer is absent, stale, or does not include all requested channels.
