@@ -103,6 +103,8 @@ bool test_validate_config_only_accepts_twenty_four_streams(const std::string& bi
                       "validate output reports the bounded global stage queue default") &&
       expect_contains(result.stdout_text, "max_inflight_per_stream=4",
                       "validate output reports the proven public per-stream credit default") &&
+      expect_contains(result.stdout_text, "fan_in_policy=latest",
+                      "validate output reports the portable default fan-in policy") &&
       expect_contains(result.stdout_text,
                       (config_path.parent_path() / kModelPath).lexically_normal().string(),
                       "relative model path resolves from the config directory") &&
@@ -308,6 +310,40 @@ bool test_validate_config_only_rejects_invalid_worker_count(const std::string& b
                   expect_contains(result.stderr_text, "set inference.workers to 1",
                                   "invalid-worker error explains the shared-worker requirement");
   remove_dir(config_path.parent_path().string());
+  return ok;
+}
+
+bool test_validate_config_only_checks_fan_in_policy(const std::string& binary) {
+  const fs::path every_frame_path =
+      write_config("test_validate_config_only_accepts_every_frame_fan_in",
+                   model_header() + "streams:\n" + stream_entries(4) +
+                       "inference:\n"
+                       "  workers: 1\n"
+                       "  fan_in_policy: every_frame\n"
+                       "output:\n"
+                       "  insight:\n"
+                       "    host: 127.0.0.1\n");
+  const auto every_frame = spawn_and_wait(
+      binary, {"--config", every_frame_path.string(), "--validate-config-only"}, 20000);
+  bool ok = expect_true(every_frame.exit_code == 0, "every-frame fan-in policy validates") &&
+            expect_contains(every_frame.stdout_text, "fan_in_policy=every_frame",
+                            "validate output reports every-frame fan-in");
+  remove_dir(every_frame_path.parent_path().string());
+
+  const fs::path invalid_path = write_config("test_validate_config_only_rejects_invalid_fan_in",
+                                             model_header() + "streams:\n" + stream_entries(4) +
+                                                 "inference:\n"
+                                                 "  workers: 1\n"
+                                                 "  fan_in_policy: lossy_magic\n"
+                                                 "output:\n"
+                                                 "  insight:\n"
+                                                 "    host: 127.0.0.1\n");
+  const auto invalid =
+      spawn_and_wait(binary, {"--config", invalid_path.string(), "--validate-config-only"}, 20000);
+  ok &= expect_true(invalid.exit_code == 1, "invalid fan-in policy is rejected") &&
+        expect_contains(invalid.stderr_text, "fan_in_policy must be one of: latest, every_frame",
+                        "invalid fan-in error lists the supported portable policies");
+  remove_dir(invalid_path.parent_path().string());
   return ok;
 }
 
@@ -767,6 +803,7 @@ int main(int argc, char** argv) {
   ok &= test_validate_config_only_rejects_too_many_streams(binary);
   ok &= test_validate_config_only_rejects_insight_visible_limit_above_stream_count(binary);
   ok &= test_validate_config_only_rejects_invalid_worker_count(binary);
+  ok &= test_validate_config_only_checks_fan_in_policy(binary);
   ok &= test_validate_config_only_checks_internal_queue_depth(binary);
   ok &= test_validate_config_only_checks_max_inflight_per_stream(binary);
   ok &= test_validate_config_only_rejects_empty_streams(binary);

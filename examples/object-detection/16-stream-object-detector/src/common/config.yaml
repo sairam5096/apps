@@ -47,7 +47,8 @@ runtime:                     # Runtime and profiling settings.
 
 inference:                   # Detection controls.
   workers: 1                 # One shared detector graph avoids dispatcher/resource contention.
-  queue_depth: 4             # Proven latest-frame link depth for the 24x20 profile.
+  fan_in_policy: every_frame # One pending frame/stream with bounded producer backpressure.
+  queue_depth: 4             # Terminal detection output and Run queue depth.
   internal_queue_depth: 1    # One global model-stage handoff; not a per-camera decoded queue.
   max_inflight_per_stream: 4 # Proven per-stream mux credit for approximately 20 detections/s.
   min_score: 0.30            # Detection score threshold used by the validated Insight run.

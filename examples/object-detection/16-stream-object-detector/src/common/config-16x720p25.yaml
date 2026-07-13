@@ -42,6 +42,7 @@ runtime:
 
 inference:
   workers: 1
+  fan_in_policy: latest
   queue_depth: 16
   internal_queue_depth: 1
   max_inflight_per_stream: 1

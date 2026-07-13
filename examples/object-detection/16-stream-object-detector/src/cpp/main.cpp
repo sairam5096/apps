@@ -73,6 +73,11 @@ void request_stop(int) {
   g_stop_requested = 1;
 }
 
+enum class FanInPolicy {
+  Latest,
+  EveryFrame,
+};
+
 struct AppConfig {
   std::string model_path;
   std::string decode_type = "yolo26";
@@ -82,6 +87,7 @@ struct AppConfig {
   int queue_depth = kDefaultQueueDepth;
   int internal_queue_depth = kDefaultInternalQueueDepth;
   int max_inflight_per_stream = kDefaultMaxInflightPerStream;
+  FanInPolicy fan_in_policy = FanInPolicy::Latest;
   int decoder_buffers = kDefaultDecoderBuffers;
   int decoder_input_buffers = kDefaultDecoderInputBuffers;
   std::string decoder_tuning = "auto";
@@ -149,6 +155,34 @@ std::string normalize_decoder_tuning(std::string token) {
     return "throughput-low-latency";
   throw std::runtime_error(
       "input.decoder_tuning must be one of: auto, default, low-memory, throughput-low-latency");
+}
+
+FanInPolicy parse_fan_in_policy(const std::string& token) {
+  if (token == "latest")
+    return FanInPolicy::Latest;
+  if (token == "every_frame")
+    return FanInPolicy::EveryFrame;
+  throw std::runtime_error("inference.fan_in_policy must be one of: latest, every_frame");
+}
+
+const char* fan_in_policy_name(FanInPolicy policy) {
+  switch (policy) {
+  case FanInPolicy::Latest:
+    return "latest";
+  case FanInPolicy::EveryFrame:
+    return "every_frame";
+  }
+  return "latest";
+}
+
+simaai::neat::GraphLinkPolicy graph_link_policy(FanInPolicy policy) {
+  switch (policy) {
+  case FanInPolicy::Latest:
+    return simaai::neat::GraphLinkPolicy::RealtimeLatestByStream;
+  case FanInPolicy::EveryFrame:
+    return simaai::neat::GraphLinkPolicy::RealtimeEveryFrameByStream;
+  }
+  return simaai::neat::GraphLinkPolicy::RealtimeLatestByStream;
 }
 
 struct CliOptions {
@@ -583,6 +617,7 @@ AppConfig load_app_config(const fs::path& config_path) {
       raw.int_or("inference.internal_queue_depth", kDefaultInternalQueueDepth);
   cfg.max_inflight_per_stream =
       raw.int_or("inference.max_inflight_per_stream", kDefaultMaxInflightPerStream);
+  cfg.fan_in_policy = parse_fan_in_policy(raw.string_or("inference.fan_in_policy", "latest"));
   cfg.min_score = raw.double_or("inference.min_score", 0.55);
   cfg.nms_iou = raw.double_or("inference.nms_iou", 0.60);
   cfg.max_detections = raw.int_or("inference.max_detections", 50);
@@ -1128,7 +1163,7 @@ void connect_source_graph(AppRuntime& app, const AppConfig& cfg, SourceRuntime& 
                           const simaai::neat::Graph& detector_graph) {
   auto branch = simaai::neat::graphs::Branch("source", {"detector_frame"});
   simaai::neat::GraphLinkOptions detector_link;
-  detector_link.policy = simaai::neat::GraphLinkPolicy::RealtimeLatestByStream;
+  detector_link.policy = graph_link_policy(cfg.fan_in_policy);
   detector_link.queue_depth = cfg.queue_depth;
   detector_link.stream_id = stream_id_for(source.index);
   detector_link.max_inflight_per_stream = cfg.max_inflight_per_stream;
@@ -1680,12 +1715,15 @@ void run_app(const AppConfig& cfg) {
   aggregate_profile.enabled = cfg.profile;
   aggregate_profile.stream_count = static_cast<int>(cfg.rtsp_urls.size());
 
-  // Fused realtime fan-in already keeps only the newest frame per stream.
-  // This small global depth only decouples shared model stages; it does not
-  // create another decoded-frame queue for every camera. GraphOptions must be
-  // set on the final composition owner rather than a nested model fragment.
+  // The selected fused realtime fan-in has one pending slot per stream. Latest
+  // mode replaces that slot; every-frame mode backpressures only that stream.
+  // This small global depth only decouples shared model stages and does not
+  // create another decoded-frame queue per camera. GraphOptions must be set on
+  // the final composition owner rather than a nested model fragment.
   AppRuntime app(cfg.internal_queue_depth);
   app.sources.reserve(cfg.rtsp_urls.size());
+  std::cout << "[detector] fan_in_policy=" << fan_in_policy_name(cfg.fan_in_policy)
+            << " max_inflight_per_stream=" << cfg.max_inflight_per_stream << "\n";
   try {
     auto detector_graph = build_detector_graph(cfg, app.model);
     for (std::size_t index = 0; index < cfg.rtsp_urls.size(); ++index) {
@@ -1750,6 +1788,7 @@ int main(int argc, char** argv) {
                 << ", workers=" << cfg.workers << ", queue_depth=" << cfg.queue_depth
                 << ", internal_queue_depth=" << cfg.internal_queue_depth
                 << ", max_inflight_per_stream=" << cfg.max_inflight_per_stream
+                << ", fan_in_policy=" << fan_in_policy_name(cfg.fan_in_policy)
                 << ", input=" << cfg.input_width << "x" << cfg.input_height << "@"
                 << cfg.input_fps << ", insight_visible_streams=" << visible_streams
                 << ", video_ports=" << cfg.video_port_base << "-" << video_port_last

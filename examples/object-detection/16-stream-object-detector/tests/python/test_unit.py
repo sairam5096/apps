@@ -124,10 +124,11 @@ class TestConfigLoading:
             "queue_depth",
             "internal_queue_depth",
             "max_inflight",
+            "fan_in_policy",
         ),
         [
-            ("config-16x720p25.yaml", 16, 25, 8, 2, "auto", 16, 1, 1),
-            ("config-24x720p20.yaml", 24, 20, 16, 2, "auto", 4, 1, 4),
+            ("config-16x720p25.yaml", 16, 25, 8, 2, "auto", 16, 1, 1, "latest"),
+            ("config-24x720p20.yaml", 24, 20, 16, 2, "auto", 4, 1, 4, "every_frame"),
             (
                 "config-48x720p10.yaml",
                 48,
@@ -138,6 +139,7 @@ class TestConfigLoading:
                 1,
                 2,
                 1,
+                "latest",
             ),
         ],
     )
@@ -152,6 +154,7 @@ class TestConfigLoading:
         queue_depth: int,
         internal_queue_depth: int,
         max_inflight: int,
+        fan_in_policy: str,
     ):
         from main import effective_insight_visible_streams, load_app_config
 
@@ -167,6 +170,7 @@ class TestConfigLoading:
         assert cfg.queue_depth == queue_depth
         assert raw["inference"]["internal_queue_depth"] == internal_queue_depth
         assert cfg.max_inflight_per_stream == max_inflight
+        assert cfg.fan_in_policy == fan_in_policy
         assert effective_insight_visible_streams(cfg) == streams
         assert (cfg.video_port_base, cfg.video_port_base + streams - 1) == (
             9000,
@@ -186,6 +190,17 @@ class TestConfigLoading:
             (COMMON_DIR / "config-24x720p20.yaml").read_text(encoding="utf-8")
         )
         assert default == named
+
+    def test_config_rejects_invalid_fan_in_policy(self, tmp_path: Path):
+        from main import load_app_config
+
+        config_path = write_config(
+            tmp_path,
+            ["rtsp://127.0.0.1:8554/src1"],
+            inference_extra="fan_in_policy: lossy_magic",
+        )
+        with pytest.raises(ValueError, match="fan_in_policy must be one of"):
+            load_app_config(config_path)
 
     def test_config_rejects_overlapping_insight_port_ranges(self, tmp_path: Path):
         from main import load_app_config
@@ -523,6 +538,7 @@ output:
         assert "workers=1" in result.stdout
         assert "queue_depth=4" in result.stdout
         assert "max_inflight_per_stream=4" in result.stdout
+        assert "fan_in_policy=latest" in result.stdout
         assert "insight_visible_streams=2" in result.stdout
         assert "decoder_admission=core" in result.stdout
 
@@ -666,7 +682,10 @@ class TestRuntimeOptions:
 
         fake_pyneat = SimpleNamespace(
             GraphLinkOptions=FakeGraphLinkOptions,
-            GraphLinkPolicy=SimpleNamespace(RealtimeLatestByStream="latest-by-stream"),
+            GraphLinkPolicy=SimpleNamespace(
+                RealtimeLatestByStream="latest-by-stream",
+                RealtimeEveryFrameByStream="every-frame-by-stream",
+            ),
         )
         monkeypatch.setattr(main, "pyneat", fake_pyneat)
 
@@ -679,6 +698,9 @@ class TestRuntimeOptions:
 
         tuned = main.graph_realtime_link(3, "stream7", 4)
         assert tuned.max_inflight_per_stream == 4
+
+        every_frame = main.graph_realtime_link(3, "stream7", 4, "every_frame")
+        assert every_frame.policy == "every-frame-by-stream"
 
     def test_stream_index_from_detection_validates_route_metadata(self):
         import main

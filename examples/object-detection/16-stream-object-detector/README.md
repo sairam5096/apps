@@ -18,7 +18,7 @@ paths:
 
 ```text
 RTSP/H.264 -> AU-aligned H.264
-  detector: SimaDecode -> latest-by-stream C++ mux -> Preproc -> YOLO26n -> Boxdecode
+  detector: SimaDecode -> configured per-stream C++ mux -> Preproc -> YOLO26n -> Boxdecode
   video:    owned CPU copy of encoded AU -> bounded delay -> VideoSender -> Insight channel N
   boxes:    detection JSON held by PTS epoch -> newest result not newer than delayed video -> channel N
 ```
@@ -52,18 +52,24 @@ No part of this queue consumes EV74 memory.
 
 The 24×20 profile configures 16 decoder output surfaces and two compressed-input buffers per
 stream. The other profiles' decoder pools are listed below. These are codec pool surfaces, not
-application video staging queues. Core also places one depth-one leaky decoded ingress queue on
-each source immediately before the latest-by-stream mux. The mux itself retains at most one
-replaceable pending decoded frame per stream and admits no more than
-`max_inflight_per_stream` selected frames from that stream into the shared detector.
+application video staging queues. Core places one depth-one decoded ingress queue on each source
+immediately before the C++ mux. `inference.fan_in_policy` selects how that bounded handoff works:
+
+- `latest` keeps the ingress queue leaky and replaces a stream's pending mux frame with its newest
+  frame. Producers do not block.
+- `every_frame` makes the existing ingress queue non-leaky. The mux retains one pending frame per
+  stream and backpressures only that stream until the worker consumes it. This does not allocate a
+  second queue.
+
+Both policies admit no more than `max_inflight_per_stream` selected frames from one stream into
+the shared detector.
 
 `internal_queue_depth` is shared consumer-stage buffering, not one queue per camera. A positive
 value inserts a bounded, non-leaky queue of that depth before each CVU, MLA, and box-decode stage
-in the fused detector pipeline. For this model that means three shared stage queues. In the
-controlled 24×20 tuning run, the earlier depth/credit-one profile produced a median 17.0
-detections/s per stream; `queue_depth=4`, `internal_queue_depth=1`, and
-`max_inflight_per_stream=4` produced 19.91 with zero encoded-video queue rejects. These are now
-defaults rather than unpinned tuning candidates.
+in the fused detector pipeline. For this model that means three shared stage queues. The 24×20
+profile uses `every_frame` so bursty decoder delivery cannot repeatedly replace frames from the
+same channels before the shared detector sees them. The original 16-stream profile and the 48×10
+profile retain `latest` admission.
 
 PTS is matched within an epoch rather than as one never-ending numeric timeline. The ordered,
 no-B-frame encoded branch is the only authority that starts a new epoch after a large backward
@@ -81,19 +87,19 @@ is intentionally applied to a later video AU in the same epoch rather than sent 
 The profile name includes its stream count, resolution, and source FPS. Edit only the RTSP URLs
 and Insight host when moving to another lab; do not silently change its buffer geometry.
 
-| Config | Sources | Decoder out/in | Detector q/i/m | Insight ports | Basis |
-| --- | ---: | ---: | ---: | --- | --- |
-| `config-16x720p25.yaml` | 16 × 1280×720 @ 25 FPS | 8 / 2 | 16 / 1 / 1 | video 9000–9015; metadata 9100–9115 | Original 16-stream profile recovered from Apps `9ab92cd` |
-| `config-24x720p20.yaml` | 24 × 1280×720 @ 20 FPS | 16 / 2 | 4 / 1 / 4 | video 9000–9023; metadata 9100–9123 | Proven 24×20 profile, 19.91 detections/s/stream median |
-| `config-48x720p10.yaml` | 48 × 1280×720 @ 10 FPS | 4 / 2 | 1 / 2 / 1 | video 9000–9047; metadata 9100–9147 | Validated B4 48×10 profile |
+| Config | Sources | Decoder out/in | Fan-in | Detector q/i/m | Insight ports | Basis |
+| --- | ---: | ---: | --- | ---: | --- | --- |
+| `config-16x720p25.yaml` | 16 × 1280×720 @ 25 FPS | 8 / 2 | `latest` | 16 / 1 / 1 | video 9000–9015; metadata 9100–9115 | Original 16-stream profile recovered from Apps `9ab92cd` |
+| `config-24x720p20.yaml` | 24 × 1280×720 @ 20 FPS | 16 / 2 | `every_frame` | 4 / 1 / 4 | video 9000–9023; metadata 9100–9123 | Bounded per-stream backpressure for bursty decoder output |
+| `config-48x720p10.yaml` | 48 × 1280×720 @ 10 FPS | 4 / 2 | `latest` | 1 / 2 / 1 | video 9000–9047; metadata 9100–9147 | Validated B4 48×10 profile |
 
 Here `q/i/m` means `queue_depth`, `internal_queue_depth`, and
 `max_inflight_per_stream`. `q` sizes the terminal every-frame detection output and the Run's
 general output queue; it is also retained on the public source link for non-fused compatibility.
-The fused latest-by-stream mux does not retain `q` decoded frames per camera: it has one
-replaceable pending slot per stream, and `m` is its per-stream selected-frame credit. `i` is the
-depth of each shared consumer-stage queue described above. `src/common/config.yaml` remains a
-compatibility alias containing the same values as the named 24×20 profile. The historical
+The fused mux does not retain `q` decoded frames per camera: it has one pending slot per stream,
+and `m` is its per-stream selected-frame credit. `i` is the depth of each shared consumer-stage
+queue described above. `src/common/config.yaml` remains a compatibility alias containing the
+same values as the named 24×20 profile. The historical
 16-stream config predates the internal queue and public credit settings; the current profile makes
 their bounded values `1` explicit while preserving its original 25 FPS, 8/2 decoder pools, and
 detection output/Run queue depth 16.
@@ -150,7 +156,7 @@ The config check should report:
 
 ```text
 streams=24, model_path=..., labels_path=..., workers=1, queue_depth=4, internal_queue_depth=1,
-max_inflight_per_stream=4,
+max_inflight_per_stream=4, fan_in_policy=every_frame,
 insight_visible_streams=24, sync_delay_ms=400, decoder_admission=core
 ```
 
@@ -177,13 +183,16 @@ Important YAML settings:
 - `input.skip_rtsp_probe: true` requires correct width, height, and FPS.
 - `input.drop_on_latency: true` prevents a stale RTSP backlog.
 - `inference.workers` must be `1`.
+- `inference.fan_in_policy` accepts `latest` or `every_frame`. The 24×20 profile uses
+  `every_frame` to preserve each frame that reaches the fused mux with bounded per-stream
+  backpressure. The 16×25 and 48×10 profiles use `latest` to preserve their existing nonblocking
+  behavior.
 - `inference.queue_depth: 4` is the proven terminal detection output/Run queue depth for 24×20.
-  The fused mux still has only one replaceable pending slot per stream.
+  The fused mux still has only one pending slot per stream.
 - `inference.internal_queue_depth` is the depth of each bounded shared CVU/MLA/box-decode stage
   queue, not a per-camera decoded-frame queue. The proven value is `1`.
-- `inference.max_inflight_per_stream: 4` is the proven public latest-mux credit for each camera.
-  Together these settings sustained approximately 20 detections/s per channel without encoded
-  video rejects. Do not replace them with private environment overrides.
+- `inference.max_inflight_per_stream: 4` is the public mux credit for each 24×20 camera. Do not
+  replace it or the public fan-in policy with private environment overrides.
 - `output.insight.max_visible_streams` publishes the first N configured streams. Streams after
   N still run inference but intentionally have no Insight video or metadata sender. Set it to
   the stream count for acceptance. Core's encoded callback is graph-global: with partial
@@ -426,7 +435,8 @@ tests.
 ## Python scope
 
 `src/python/main.py` remains a small graph-native API reference. It resolves config-relative
-assets and shares basic config validation, but it does **not** implement the validated C++
+assets, validates `inference.fan_in_policy`, and selects the matching public link policy. It does
+**not** implement the validated C++
 encoded-AU delay/PTS-epoch synchronization or the proven 24-channel dispatch architecture.
 Do not use the Python path for the 24×20 handoff or Insight acceptance result.
 

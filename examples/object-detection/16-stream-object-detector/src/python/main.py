@@ -21,6 +21,7 @@ DEFAULT_INITIAL_DETECTION_TIMEOUT_MS = 30_000
 DETECTOR_RESULT_TIMEOUT_MS = 5_000
 DEFAULT_QUEUE_DEPTH = 4
 DEFAULT_MAX_INFLIGHT_PER_STREAM = 4
+DEFAULT_FAN_IN_POLICY = "latest"
 DEFAULT_DECODER_BUFFERS = 16
 DEFAULT_DECODER_INPUT_BUFFERS = 2
 ALL_INSIGHT_STREAMS = -1
@@ -40,6 +41,7 @@ class AppConfig:
     workers: int = 1
     queue_depth: int = DEFAULT_QUEUE_DEPTH
     max_inflight_per_stream: int = DEFAULT_MAX_INFLIGHT_PER_STREAM
+    fan_in_policy: str = DEFAULT_FAN_IN_POLICY
     decoder_buffers: int = DEFAULT_DECODER_BUFFERS
     decoder_input_buffers: int = DEFAULT_DECODER_INPUT_BUFFERS
     decoder_tuning: str = "auto"
@@ -290,6 +292,12 @@ def normalize_decoder_tuning(token: str) -> str:
     )
 
 
+def normalize_fan_in_policy(token: str) -> str:
+    if token in ("latest", "every_frame"):
+        return token
+    raise ValueError("inference.fan_in_policy must be one of: latest, every_frame")
+
+
 def validate_config(cfg: AppConfig) -> None:
     if not cfg.model_path:
         raise ValueError("model.path must be set")
@@ -312,6 +320,7 @@ def validate_config(cfg: AppConfig) -> None:
         raise ValueError("inference.max_inflight_per_stream must be > 0")
     if cfg.max_inflight_per_stream > 32:
         raise ValueError("inference.max_inflight_per_stream must be <= 32")
+    normalize_fan_in_policy(cfg.fan_in_policy)
     if cfg.decoder_buffers <= 0:
         raise ValueError("input.decoder_buffers must be > 0")
     if cfg.decoder_buffers > 64:
@@ -436,6 +445,9 @@ def load_app_config(config_path: Path) -> AppConfig:
         queue_depth=queue_depth,
         max_inflight_per_stream=int_or(
             inference, "max_inflight_per_stream", DEFAULT_MAX_INFLIGHT_PER_STREAM
+        ),
+        fan_in_policy=normalize_fan_in_policy(
+            string_or(inference, "fan_in_policy", DEFAULT_FAN_IN_POLICY)
         ),
         decoder_buffers=int_or(input_cfg, "decoder_buffers", DEFAULT_DECODER_BUFFERS),
         decoder_input_buffers=int_or(
@@ -671,6 +683,7 @@ def graph_realtime_link(
     queue_depth: int,
     stream_id: str,
     max_inflight_per_stream: int = DEFAULT_MAX_INFLIGHT_PER_STREAM,
+    fan_in_policy: str = DEFAULT_FAN_IN_POLICY,
 ):
     if not hasattr(pyneat, "GraphLinkOptions") or not hasattr(pyneat, "GraphLinkPolicy"):
         raise RuntimeError(
@@ -678,7 +691,16 @@ def graph_realtime_link(
             "install the matching Neat package before running this graph-native app"
         )
     link = pyneat.GraphLinkOptions()
-    link.policy = pyneat.GraphLinkPolicy.RealtimeLatestByStream
+    fan_in_policy = normalize_fan_in_policy(fan_in_policy)
+    if fan_in_policy == "every_frame":
+        if not hasattr(pyneat.GraphLinkPolicy, "RealtimeEveryFrameByStream"):
+            raise RuntimeError(
+                "installed pyneat does not expose RealtimeEveryFrameByStream; "
+                "install the matching Neat package before using every_frame fan-in"
+            )
+        link.policy = pyneat.GraphLinkPolicy.RealtimeEveryFrameByStream
+    else:
+        link.policy = pyneat.GraphLinkPolicy.RealtimeLatestByStream
     link.queue_depth = queue_depth
     link.stream_id = stream_id
     link.max_inflight_per_stream = max_inflight_per_stream
@@ -952,6 +974,7 @@ def connect_source_graph(
         cfg.queue_depth,
         stream_id_for(source.index),
         cfg.max_inflight_per_stream,
+        cfg.fan_in_policy,
     )
 
     if cfg.video_enabled and is_insight_visible_stream(cfg, source.index):
@@ -1071,7 +1094,16 @@ def run_app(cfg: AppConfig) -> None:
         if cfg.profile and app_print_backend():
             print(f"Application backend:\n{app.graph.describe_backend()}")
 
-        app.run = app.graph.build(realtime_options(cfg.queue_depth))
+        run_options = realtime_options(cfg.queue_depth)
+        if cfg.fan_in_policy == "every_frame":
+            if not hasattr(app.graph, "build_fused_realtime_source"):
+                raise RuntimeError(
+                    "installed pyneat does not expose build_fused_realtime_source; "
+                    "install the matching Neat package before using every_frame fan-in"
+                )
+            app.run = app.graph.build_fused_realtime_source(run_options)
+        else:
+            app.run = app.graph.build(run_options)
         pull_detections(app, cfg, aggregate_profile)
     finally:
         if app.run is not None:
@@ -1096,6 +1128,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"(streams={len(cfg.rtsp_urls)}, workers={cfg.workers}, "
                 f"queue_depth={cfg.queue_depth}, "
                 f"max_inflight_per_stream={cfg.max_inflight_per_stream}, "
+                f"fan_in_policy={cfg.fan_in_policy}, "
                 f"insight_visible_streams={effective_insight_visible_streams(cfg)}, "
                 "decoder_admission=core)"
             )
