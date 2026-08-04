@@ -1,6 +1,7 @@
 {
   "neat-core": {
-    "policy": "snap"
+    "branch": "codex/superpoint-feature-extractor",
+    "spec": "cef7319bd514"
   },
   "sdk": {
     "channel": "develop"
